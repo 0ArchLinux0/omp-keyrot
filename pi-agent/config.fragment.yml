@@ -1,0 +1,9 @@
+extensions:
+  - @HOME@/.pi/agent/extensions/load-env.ts
+  - @HOME@/.pi/agent/extensions/live-status.ts
+  - @HOME@/.pi/agent/extensions/xot.ts
+  - @HOME@/.pi/agent/extensions/auto-rotate.ts
+  - @HOME@/.pi/agent/extensions/model-rotation.ts
+  - @HOME@/.pi/agent/extensions/retry-guard.ts
+  - @HOME@/.pi/agent/extensions/xot-queue.ts
+  - @HOME@/.pi/agent/extensions/xot-router.ts

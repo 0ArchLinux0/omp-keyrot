@@ -6,7 +6,7 @@ HOME="${HOME:-/home/$(id -un)}"
 
 echo "==> omp-keyrot install into $HOME"
 
-mkdir -p "$HOME/.local/bin" "$HOME/.local/daemon/xot" "$HOME/.pi/agent/extensions" "$HOME/.pi/agent/skills/xot"
+mkdir -p "$HOME/.local/bin" "$HOME/.local/daemon/xot" "$HOME/.pi/agent/extensions" "$HOME/.pi/agent/skills/xot" "$HOME/.pi/agent"
 
 install -m 0755 "$ROOT/bin/xot-rotate" "$HOME/.local/bin/xot-rotate"
 ln -sfn "$HOME/.local/bin/xot-rotate" "$HOME/.local/bin/xot"
@@ -19,6 +19,21 @@ for f in "$ROOT/pi-extensions"/*.ts; do
   cp "$f" "$HOME/.pi/agent/extensions/$(basename "$f")"
 done
 cp "$ROOT/skills/xot/SKILL.md" "$HOME/.pi/agent/skills/xot/SKILL.md"
+
+# .env (strict rotate + placeholders; never overwrite existing)
+if [ ! -f "$HOME/.pi/agent/.env" ]; then
+  cp "$ROOT/pi-agent/.env.example" "$HOME/.pi/agent/.env"
+  chmod 600 "$HOME/.pi/agent/.env"
+  echo "Created $HOME/.pi/agent/.env from .env.example (edit with your secrets)"
+else
+  if ! grep -q '^XOT_STRICT_ROTATE=' "$HOME/.pi/agent/.env" 2>/dev/null; then
+    echo "XOT_STRICT_ROTATE=1" >> "$HOME/.pi/agent/.env"
+    echo "Appended XOT_STRICT_ROTATE=1 to existing .env"
+  fi
+fi
+
+# config.yml — ensure load-env + live-status + xot stack are registered
+bash "$ROOT/scripts/merge-config.sh"
 
 # systemd user units (Linux)
 if command -v systemctl >/dev/null 2>&1 && [ -d "$HOME/.config" ]; then
@@ -44,6 +59,7 @@ esac
 
 echo "Done. Next:"
 echo "  1. Fill $HOME/.local/daemon/xot/keys"
-echo "  2. xot status"
-echo "  3. cp llm-orchestrator/.env.example llm-orchestrator/.env && npm install && npm start"
+echo "  2. Edit $HOME/.pi/agent/.env if needed (XOT_STRICT_ROTATE=1)"
+echo "  3. xot status"
 echo "  4. Restart omp / pi so extensions reload"
+echo "  5. (optional) llm-orchestrator + kakao-bot — see README"

@@ -64,7 +64,7 @@ function resolveXotBin(): { cmd: string; argsPrefix: string[] } | null {
 // in-process fallback below).
 const PROBED_KEY_CANDIDATES = [
   process.env.PI_KEY_PROBE,
-  "$HOME/Downloads/Work/code_repo/ox-alpha/scripts/pi_key_probe.py",
+  "/Users/minjunyeah/Downloads/Work/code_repo/ox-alpha/scripts/pi_key_probe.py",
   join(homedir(), "code_repo", "ox-alpha", "scripts", "pi_key_probe.py"),
 ].filter((p): p is string => !!p);
 function resolveProbedKey(): string | null {
@@ -389,7 +389,7 @@ const PICK_MODE = (process.env.XOT_PICK_MODE ?? "round_robin").toLowerCase();
 // causing 1->2->1->2 ping-pong because the cool-check + free-tier
 // pessimization in auto-rotate.ts kept marking alternating keys as
 // "all keys exhausted" without actually cooling them in xot's state.
-const STRICT_ROTATE = true; // user: sequential 1->2->...->14->1 every request
+const STRICT_ROTATE = process.env.XOT_STRICT_ROTATE !== "0";
 function pickKeyInProcess(): string | null {
   const keysPath = join(XOT_DIR, "keys");
   if (!existsSync(keysPath)) return null;
@@ -548,8 +548,8 @@ export default function (pi: any) {
   const safeNotify = (ctx: any, msg: string, type: string) => {
     try { if (ctx && ctx.ui && typeof ctx.ui.notify === "function") ctx.ui.notify(msg, type); } catch {}
   };
-  const safeSetStatus = (ctx: any, key: string, text: string) => {
-    try { if (ctx && ctx.ui && typeof ctx.ui.setStatus === "function") ctx.ui.setStatus(key, text); } catch {}
+  const safeSetStatus = (_ctx: any, _key: string, _text: string) => {
+    // Footer reserved for XOT key identity (live-status). Alerts use notify.
   };
   const safeSendUserMessage = async (ctx: any, text: string): Promise<boolean> => {
     if (ctx && typeof ctx.sendUserMessage === "function") {
@@ -578,6 +578,38 @@ export default function (pi: any) {
   // declaration is hoisted; semantically equivalent to `let null`.
   var lastModel: string | null = null;             // most recent model the agent asked for
   let activeKey: string | null = pickKey();
+
+  function isOpenRouterProvider(event: any): boolean {
+    const provider =
+      event?.provider ??
+      event?.request?.provider ??
+      event?.model?.provider ??
+      "";
+    if (typeof provider === "string" && /openrouter/i.test(provider)) return true;
+    const url = String(event?.url ?? event?.request?.url ?? "");
+    return /openrouter\.ai/i.test(url);
+  }
+
+  // omp 18.x dropped before_provider_headers; inject auth via registerProvider instead.
+  function applyOpenRouterKey(key: string): void {
+    process.env.OPENROUTER_API_KEY = key;
+    try {
+      if (typeof pi?.registerProvider === "function") {
+        pi.registerProvider("openrouter", { apiKey: key, authHeader: true });
+      }
+    } catch {}
+  }
+
+  function ensureActiveKeyForRequest(): string | null {
+    if (STRICT_ROTATE) {
+      activeKey = pickKey();
+    } else if (!activeKey) {
+      activeKey = pickKey();
+    }
+    return activeKey;
+  }
+
+  if (activeKey) applyOpenRouterKey(activeKey);
 
   // Auto-fallback state: when a model hits 402 (insufficient balance),
   // we switch to the next model in MODEL_FALLBACKS. To honour the
@@ -622,19 +654,12 @@ export default function (pi: any) {
   // turns, which is what the user expects to see in the live status
   // bar: a fresh key alias per turn.
   pi.on("session_start", async (_event: any, _ctx: any) => {
-    // On a fresh session, clear any stale retry marker from a previous
-    // session. We don't auto-replay the prompt because the new session
-    // may have a different model, cwd, or user context. The user can
-    // re-send manually if they want.
     const state = loadRetryState();
     if (state && state.needsRetry) {
       const ageMin = Math.round((Date.now() - state.timestamp) / 60_000);
       if (ageMin >= retryConfig.stickyForMinutes) {
         clearRetryState();
       } else {
-        // Still fresh; surface a clear status so the user knows what's
-        // pending and can `/xot retry-cancel` if they want to drop it.
-        // Avoid auto-replaying because session state has changed.
         safeNotify(
           _ctx,
           `xot: a retry is pending from ${ageMin}m ago. /xot retry-status to inspect, /xot continue to replay, /xot retry-cancel to drop.`,
@@ -645,9 +670,6 @@ export default function (pi: any) {
   });
 
   pi.on("before_agent_start", async (_event: any, ctx: any) => {
-    // New user prompt = fresh cycle. Reset the full-cycle counter so
-    // a successful previous prompt doesn't lock us into "this model
-    // already tried N times" mode for the new prompt.
     cycleAttempts = 0;
     cycleModel = null;
     const next = pickKey();
@@ -657,13 +679,7 @@ export default function (pi: any) {
       const newShort = mask(activeKey);
       console.error(`xot: rotated for new turn — ${oldShort}… → ${newShort}…`);
     }
-    // Auto-revert: if we previously auto-switched to a fallback model
-    // after a 402, switch back to the user's original model on the next
-    // user prompt. Skip the revert if:
-    //   - the original model is still in backoff (it'd just 402 again)
-    //   - the user manually picked a different model in the meantime
-    //     (manualModelOverride is set on pi.setModel detection — see below)
-    //   - we have no `ctx` to inspect settings
+    if (activeKey) applyOpenRouterKey(activeKey);
     if (originalDefaultModel && !manualModelOverride && (ctx as any)?.modelRegistry?.find) {
       const cur = (ctx as any).model;
       const curName = cur ? `${cur.provider}/${cur.id}` : null;
@@ -687,6 +703,19 @@ export default function (pi: any) {
     }
   });
 
+  pi.on("before_provider_request", (event: any) => {
+    if (!isOpenRouterProvider(event)) return;
+    const key = ensureActiveKeyForRequest();
+    if (!key) return;
+    applyOpenRouterKey(key);
+    const model = extractModel(event);
+    if (model) {
+      lastModel = model;
+      try { runXot(["set-model", model]); } catch {}
+    }
+  });
+
+
   // Detect manual model changes so we don't auto-revert over them.
   // When the user (or the built-in /model selector) sets a model
   // explicitly, pi emits `model_select`. If we have an auto-fallback
@@ -703,31 +732,36 @@ export default function (pi: any) {
     }
   });
 
+
+
   pi.on("before_provider_headers", (event: any) => {
-    if (!activeKey) activeKey = pickKey();
-    if (!activeKey) return;
-    if (!switching && isCooling(activeKey)) {
+    if (!isOpenRouterProvider(event)) return;
+
+    const key = ensureActiveKeyForRequest();
+    if (!key) return;
+    applyOpenRouterKey(key);
+
+    if (!STRICT_ROTATE && !switching && isCooling(key)) {
       switching = true;
       try {
         const next = pickKey();
-        if (next && next !== activeKey) {
-          const oldShort = mask(activeKey);
+        if (next && next !== key) {
+          const oldShort = mask(key);
           activeKey = next;
           limitedCount = 0;
+          applyOpenRouterKey(next);
           console.error(`xot: key ${oldShort}… cooling elsewhere — switched pre-emptively`);
         }
       } finally { switching = false; }
     }
+
+    event.headers = event.headers ?? {};
     event.headers["x-api-key"] = activeKey;
     event.headers["authorization"] = `Bearer ${activeKey}`;
 
-    // Remember the model the agent is asking for. xot pick consults this
-    // to decide whether to short-circuit (when the model is in backoff).
-    // The model can appear in event.model, event.request?.model, or the URL.
     const model = extractModel(event);
     if (model) {
       lastModel = model;
-      // Best-effort write to the state file. Don't block on failure.
       try {
         runXot(["set-model", model]);
       } catch {}
@@ -755,7 +789,7 @@ export default function (pi: any) {
           runXot(["model-backoff", lastModel, String(dailyResetSec)]);
         }
         // Surface a clear status so the user knows what's happening
-        ctx.ui.setStatus("xot", `daily pool exhausted · wait ${(dailyResetSec / 3600).toFixed(1)}h or /model`);
+        // setStatus disabled: daily pool exhausted (see notify above)
         limitedCount = 0;
         return;
       }
@@ -766,8 +800,7 @@ export default function (pi: any) {
       // rotating between keys is futile — we must back off the model.
       const isUpstreamPool = ra != null && ra >= 30;
       limitedCount++;
-      ctx.ui.setStatus("xot",
-        `limit hit ${limitedCount}/${THRESHOLD}` + (ra != null ? ` · retry after ${ra}s` : ""));
+      // setStatus disabled: limit hit counter
       if (isUpstreamPool && lastModel) {
         // Upstream pool is shared across all our keys. Don't burn the
         // remaining retry budget on the same dead model. Set a model
@@ -781,7 +814,7 @@ export default function (pi: any) {
         // Force a model rotation too, since the user should be told to
         // pick a different model. We don't auto-switch (that would break
         // the user's chosen model), but we set a status so it's visible.
-        ctx.ui.setStatus("xot", `upstream 429 · try a different model (${lastModel} backed off ${backoff}s)`);
+        // setStatus disabled: upstream 429 (see notify above)
         // Don't trigger key rotation here; the issue is the model.
         // Reset the local counter so the next non-429 response starts fresh.
         limitedCount = 0;
@@ -795,7 +828,7 @@ export default function (pi: any) {
       // sanitizer throws `Cannot read properties of null (reading 'replace')`
       // and pi exits with uncaughtException. Workaround: use "" to clear
       // instead of undefined, which the sanitizer handles fine.
-      ctx.ui.setStatus("xot", "");
+      // setStatus disabled: success clear
       // Full-cycle policy: a successful response on the current model
       // means the model is healthy. Reset the cycle counter so the next
       // failure on this model starts a fresh cycle from 0 attempts.
@@ -1138,7 +1171,7 @@ export default function (pi: any) {
       lastRotationTime = Date.now();
       const oldShort = mask(activeKey);
       ctx.ui.notify(`xot: rotated — key switched, continuing`, "info");
-      ctx.ui.setStatus("xot", "rotated");
+      // setStatus disabled: rotated
     } else {
       // 4) pickKey returned the same key it already had. This means
       //    all the other keys are in cooldown (or in Tier-2 backoff
@@ -1151,7 +1184,7 @@ export default function (pi: any) {
           `continuing with current key ${mask(activeKey)}…`,
         "warning",
       );
-      ctx.ui.setStatus("xot", "stuck");
+      // setStatus disabled: stuck
     }
     limitedCount = 0;
   }

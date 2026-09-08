@@ -357,7 +357,8 @@ export default function (pi: ExtensionAPI) {
   // (or pessimistically give up on :free models). The result was the
   // 1->2->1->2 ping-pong. We still LOG the error so the user can see
   // what happened, but we do not change the active key.
-  const strictRotate = process.env.XOT_STRICT_ROTATE === "1";
+  // Default ON (set XOT_STRICT_ROTATE=0 to disable). Matches xot.ts sequential rotation.
+  const strictRotate = process.env.XOT_STRICT_ROTATE !== "0";
 
   // HTTP-level rate-limit / blocked / 403 / 401
   pi.on("after_provider_response", async (event, ctx) => {
@@ -400,21 +401,36 @@ export default function (pi: ExtensionAPI) {
     // "insufficient balance" substring and let other shared-pool shapes
     // fall through to key rotation, causing the #1 <-> #2 ping-pong the
     // user reported.
+    if (strictRotate) return;
+
     const insufficientBalance = typeof errMsg === "string" && INSUFFICIENT_BALANCE_RE.test(errMsg);
     const isSharedPool = typeof errMsg === "string" && SHARED_POOL_RE.test(errMsg);
-    if (insufficientBalance || stopReason === "error") {
-      const kind: Last429["kind"] = insufficientBalance || isSharedPool ? "shared_pool" : classifyErrorBody(errMsg, msg?.http ?? 429);
-      tryRotateOnError(
-        insufficientBalance ? "insufficient balance" : isSharedPool ? "shared pool" : "stream error",
-        ctx as any,
-        {
-          kind,
-          model: (event as any)?.message?.model ?? (event as any)?.model,
-          http: msg?.http ?? 429,
-          body: errMsg,
-        }
-      );
+    const isAuthMissing =
+      typeof errMsg === "string" && /missing authentication header/i.test(errMsg);
+    const isRateLimited =
+      typeof errMsg === "string" &&
+      (INSUFFICIENT_BALANCE_RE.test(errMsg) ||
+        SHARED_POOL_RE.test(errMsg) ||
+        TIMEOUT_RE.test(errMsg) ||
+        /\b(429|402|403|520)\b/.test(errMsg));
+
+    if (isAuthMissing) return;
+    if (!insufficientBalance && !isSharedPool && !(stopReason === "error" && isRateLimited)) {
+      return;
     }
+
+    const kind: Last429["kind"] =
+      insufficientBalance || isSharedPool ? "shared_pool" : classifyErrorBody(errMsg, msg?.http ?? 429);
+    tryRotateOnError(
+      insufficientBalance ? "insufficient balance" : isSharedPool ? "shared pool" : "rate limit",
+      ctx as any,
+      {
+        kind,
+        model: (event as any)?.message?.model ?? (event as any)?.model,
+        http: msg?.http ?? 429,
+        body: errMsg,
+      }
+    );
   });
 
   // Pre-send: back off if the last failure was a shared-pool hit, and

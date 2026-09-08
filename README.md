@@ -65,11 +65,13 @@ cd omp-keyrot; powershell -File scripts/update.ps1
 
 | Thing | Sync via git? | Why |
 |-------|----------------|-----|
-| `bin/xot-rotate`, pi-extensions, orchestrator, kakao-bot | **Yes** | version of this overlay |
+| `bin/xot-rotate`, `pi-extensions/*` (xot, auto-rotate, **live-status**, load-env, …) | **Yes** | rotation + status bar logic |
+| `pi-agent/.env.example`, `pi-agent/config.example.yml` | **Yes** (templates) | install creates local copies |
 | `xot/config.example.json` | **Yes** (example only) | rotation policy template |
 | `~/.local/daemon/xot/keys` | **No** | OpenRouter secrets |
 | `~/.local/daemon/xot/state` | **No** | live `ACTIVE_IDX` + cooling |
 | `~/.local/daemon/xot/leases` | **No** | per-window / per-machine claims |
+| `~/.pi/agent/.env` (real) | **No** | secrets + host-specific |
 | `llm-orchestrator/.env` | **No** | host-specific (Ollama URL, VRAM) |
 
 **Code/version:** git is the source of truth. Pull + `update.sh` on each box.
@@ -85,7 +87,8 @@ Optional: sync **only** `keys` with Syncthing/iCloud, never `state`/`leases`.
 | Path | Role |
 |------|------|
 | `~/.local/bin/xot` | Round-robin key picker. `(idx+1)%N`. Cool on daily 429. |
-| `~/.pi/agent/extensions/{xot,auto-rotate,retry-guard,...}.ts` | omp/pi hooks |
+| `~/.pi/agent/extensions/{load-env,live-status,xot,auto-rotate,...}.ts` | env loader, **footer status bar**, rotation hooks |
+| `~/.pi/agent/.env` | `XOT_STRICT_ROTATE=1` (from `.env.example` on first install) |
 | `llm-orchestrator/` | Local OpenAI-compatible router (`:3000`) |
 | `kakao-bot/` | Kakao-style `/v1/chat` (`:7862`) |
 
@@ -116,6 +119,22 @@ xot cool <fp>         # mark a key cooling (8h default)
 ```
 
 `STRICT_ROTATE` behaviour: every pick is `(active+1) % N`, skip keys with `COOL_<fp>` until expiry.
+
+## Mac / Windows (after first clone)
+
+```bash
+cd omp-keyrot && bash scripts/update.sh    # Mac/Linux
+# powershell -File scripts/update.ps1      # Windows
+```
+
+Copy keys once from Linux (same tailnet):
+
+```bash
+scp ~/.local/daemon/xot/keys mac-m3:~/.local/daemon/xot/keys
+scp ~/.local/daemon/xot/keys win-dev:/c/Users/J/.local/daemon/xot/keys
+```
+
+Install **same omp version** as Linux (`omp/18.1.13` here). Restart omp so extensions reload.
 
 ## Secrets
 
