@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>AI Node Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0e1116;
+    --bg2: #161b22;
+    --bg3: #1f2630;
+    --fg: #c9d1d9;
+    --fg-dim: #8b949e;
+    --accent: #58a6ff;
+    --good: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+    --border: #30363d;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 12px 20px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  header h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  header .spacer { flex: 1; }
+  header .meta { font: 12px var(--mono); color: var(--fg-dim); }
+  .refresh-dot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; background: var(--good);
+    margin-right: 6px; vertical-align: middle;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+  .card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card h2 {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin: 0 0 12px;
+  }
+  .vram-bar {
+    height: 24px;
+    background: var(--bg3);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+    margin-bottom: 8px;
+  }
+  .vram-bar .used {
+    height: 100%;
+    background: linear-gradient(90deg, #1f6feb, #58a6ff);
+    transition: width 0.3s ease;
+  }
+  .vram-bar .headroom {
+    position: absolute;
+    top: 0; right: 0; height: 100%;
+    background: repeating-linear-gradient(45deg, transparent, transparent 4px, rgba(255,255,255,0.05) 4px, rgba(255,255,255,0.05) 8px);
+  }
+  .vram-numbers { display: flex; justify-content: space-between; font: 13px var(--mono); }
+  .vram-numbers .used { color: var(--accent); }
+  .vram-numbers .free { color: var(--good); }
+  .vram-numbers .total { color: var(--fg-dim); }
+  .models { margin-top: 12px; }
+  .model {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 0;
+    border-top: 1px solid var(--border);
+    font: 12px var(--mono);
+  }
+  .model:first-child { border-top: 0; }
+  .model .name { color: var(--fg); }
+  .model .size { color: var(--fg-dim); }
+  .pill {
+    display: inline-block; padding: 2px 8px;
+    font: 11px var(--mono); font-weight: 600;
+    border-radius: 10px; text-transform: uppercase; letter-spacing: 0.3px;
+  }
+  .pill.good { background: rgba(63,185,80,0.15); color: var(--good); }
+  .pill.warn { background: rgba(210,153,34,0.15); color: var(--warn); }
+  .pill.bad  { background: rgba(248,81,73,0.15);  color: var(--bad); }
+  .pill.dim  { background: var(--bg3); color: var(--fg-dim); }
+  .svc-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; font: 12px var(--mono); }
+  .svc-row .name { color: var(--fg); flex: 1; }
+  .svc-row .detail { color: var(--fg-dim); font-size: 11px; }
+  .endpoint {
+    display: block;
+    font: 12px var(--mono);
+    background: var(--bg3);
+    padding: 6px 10px;
+    border-radius: 4px;
+    margin: 4px 0;
+    color: var(--accent);
+    text-decoration: none;
+    word-break: break-all;
+  }
+  .endpoint:hover { background: #2a313c; }
+  table.reqs { width: 100%; border-collapse: collapse; font: 12px var(--mono); }
+  table.reqs th, table.reqs td { padding: 6px 8px; text-align: left; }
+  table.reqs th {
+    color: var(--fg-dim); font-weight: 600;
+    border-bottom: 1px solid var(--border);
+    text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px;
+  }
+  table.reqs td { border-bottom: 1px solid rgba(48,54,61,0.5); }
+  table.reqs tr:hover td { background: var(--bg3); }
+  .status-2 { color: var(--good); }
+  .status-4 { color: var(--warn); }
+  .status-5 { color: var(--bad); }
+  .ts { color: var(--fg-dim); white-space: nowrap; }
+  .swap-evict { color: var(--warn); font-size: 11px; }
+  .empty { color: var(--fg-dim); font-style: italic; padding: 12px 0; }
+  .footer { text-align: center; padding: 12px; color: var(--fg-dim); font: 11px var(--mono); }
+  .footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AI Node Dashboard</h1>
+  <span class="meta" id="hostname">…</span>
+  <span class="spacer"></span>
+  <span class="meta"><span class="refresh-dot"></span><span id="lastUpdate">loading…</span></span>
+</header>
+<main>
+  <div class="grid">
+    <div class="card">
+      <h2>GPU Memory (RTX 5070, 12 GB)</h2>
+      <div class="vram-bar"><div class="used" id="vramUsed" style="width:0%"></div><div class="headroom" id="vramHeadroom"></div></div>
+      <div class="vram-numbers">
+        <span class="used" id="vramUsedText">…</span>
+        <span class="total" id="vramTotalText">…</span>
+        <span class="free" id="vramFreeText">…</span>
+      </div>
+      <div class="models" id="vramModels"></div>
+    </div>
+
+    <div class="card">
+      <h2>Services</h2>
+      <div class="svc-row">
+        <span class="pill good" id="pill-llm">…</span>
+        <span class="name">Ollama (LLM / Vision / Embed)</span>
+      </div>
+      <div class="svc-row">
+        <span class="pill" id="pill-image">…</span>
+        <span class="name">image-server (SDXL-Turbo)</span>
+        <span class="detail" id="image-detail"></span>
+      </div>
+      <div class="svc-row">
+        <span class="pill" id="pill-stt">…</span>
+        <span class="name">stt-server (faster-whisper)</span>
+        <span class="detail" id="stt-detail"></span>
+      </div>
+      <div style="margin-top:12px">
+        <h2 style="margin-bottom:8px">Remote (future Mac via MLX)</h2>
+        <div id="macState" class="svc-row"><span class="pill dim">…</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Ollama Models (installed)</h2>
+      <div id="ollamaList"></div>
+    </div>
+
+    <div class="card">
+      <h2>Quick Links</h2>
+      <a class="endpoint" href="/health" target="_blank">/health</a>
+      <a class="endpoint" href="/vram" target="_blank">/vram</a>
+      <a class="endpoint" href="/v1/models" target="_blank">/v1/models</a>
+      <a class="endpoint" href="/api/dashboard" target="_blank">/api/dashboard (JSON)</a>
+      <p class="empty" style="font-size:11px; margin-top:8px">
+        All endpoints are OpenAI-compatible. The Mac (when configured) takes over the
+        <code>/v1/chat/completions</code> endpoint for big models automatically.
+      </p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Recent Requests (last 30)</h2>
+    <div style="overflow-x:auto">
+      <table class="reqs">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Method</th>
+            <th>Path</th>
+            <th>Model</th>
+            <th>Status</th>
+            <th>Took</th>
+            <th>Bytes</th>
+            <th>Swap</th>
+          </tr>
+        </thead>
+        <tbody id="reqsBody">
+          <tr><td colspan="8" class="empty">No requests yet…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</main>
+<div class="footer">
+  auto-refresh every 3s &middot; <a href="/api/requests/clear" target="_blank">clear log</a>
+</div>
+
+<script>
+const REFRESH_MS = 3000;
+function pill(text, kind) { return `<span class="pill ${kind}">${text}</span>`; }
+function fmtBytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024*1024) return `${(n/1024).toFixed(1)} KB`;
+  if (n < 1024*1024*1024) return `${(n/1024/1024).toFixed(1)} MB`;
+  return `${(n/1024/1024/1024).toFixed(2)} GB`;
+}
+function fmtMs(n) { return n == null ? "—" : `${n}ms`; }
+function shortTs(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3,'0');
+}
+function statusClass(s) {
+  if (s == null) return "";
+  if (s >= 500) return "status-5";
+  if (s >= 400) return "status-4";
+  return "status-2";
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/api/dashboard", { cache: "no-store" });
+    const d = await r.json();
+
+    document.getElementById("hostname").textContent = d.hostname;
+    document.getElementById("lastUpdate").textContent =
+      new Date(d.now).toLocaleTimeString([], { hour12: false });
+
+    // VRAM
+    const usedPct = (d.vram.usedGiB / d.vram.totalGiB) * 100;
+    document.getElementById("vramUsed").style.width = `${usedPct}%`;
+    document.getElementById("vramUsedText").textContent = `${d.vram.usedGiB} GB used`;
+    document.getElementById("vramTotalText").textContent = `${d.vram.totalGiB} GB total`;
+    document.getElementById("vramFreeText").textContent = `${d.vram.freeGiB} GB free`;
+    const headroomPct = (d.vram.headroomMiB / 1024 / d.vram.totalGiB) * 100;
+    document.getElementById("vramHeadroom").style.width = `${headroomPct}%`;
+    document.getElementById("vramHeadroom").title = `headroom ${d.vram.headroomMiB} MiB reserved`;
+
+    document.getElementById("vramModels").innerHTML = d.vram.models.length === 0
+      ? '<div class="empty">nothing loaded</div>'
+      : d.vram.models.map(m => `
+        <div class="model">
+          <span class="name">${m.name}</span>
+          <span class="size">${m.vramMiB} MiB · ${m.family || ""} ${m.parameterSize || ""}</span>
+        </div>`).join("");
+
+    // Services
+    const setPill = (id, ok, label) => {
+      const el = document.getElementById(id);
+      el.className = `pill ${ok ? "good" : "bad"}`;
+      el.textContent = label;
+    };
+    setPill("pill-llm", d.services.llm.ok, "UP");
+    setPill("pill-image", d.services.image.ok, d.services.image.ok ? "UP" : "DOWN");
+    document.getElementById("image-detail").textContent = d.services.image.ok
+      ? `vram=${(d.services.image.vram_mib || 0).toFixed ? (d.services.image.vram_mib).toFixed(0) : d.services.image.vram_mib || 0} MiB`
+      : (d.services.image.error || "");
+    setPill("pill-stt", d.services.stt.ok, d.services.stt.ok ? "UP" : "DOWN");
+    document.getElementById("stt-detail").textContent = d.services.stt.ok
+      ? `model=${d.services.stt.current_model || d.services.stt.default_model || "?"}`
+      : (d.services.stt.error || "");
+
+    // Mac
+    const macEl = document.getElementById("macState");
+    if (d.config.macConfigured) {
+      macEl.innerHTML = `${pill("UP", "good")} <span class="name" style="font:12px var(--mono);color:var(--fg)">${d.config.macBaseUrl}</span>`;
+    } else {
+      macEl.innerHTML = `${pill("NOT CONFIGURED", "dim")} <span class="detail" style="font:11px">set MAC_LLM_BASE_URL in .env then systemctl restart llm-orchestrator</span>`;
+    }
+
+    // Ollama models
+    const olist = document.getElementById("ollamaList");
+    olist.innerHTML = d.ollamaModels.length === 0
+      ? '<div class="empty">no models installed</div>'
+      : d.ollamaModels.map(m => `
+        <div class="model">
+          <span class="name">${m.name}</span>
+          <span class="size">${fmtBytes(m.size)} · ${m.family || ""} ${m.parameterSize || ""}</span>
+        </div>`).join("");
+
+    // Requests
+    const tbody = document.getElementById("reqsBody");
+    if (d.requests.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">No requests yet…</td></tr>';
+    } else {
+      tbody.innerHTML = d.requests.map(r => `
+        <tr>
+          <td class="ts">${shortTs(r.ts)}</td>
+          <td>${r.method}</td>
+          <td>${r.path}</td>
+          <td>${r.model || ""}</td>
+          <td class="${statusClass(r.status)}">${r.status || ""}</td>
+          <td>${fmtMs(r.tookMs)}</td>
+          <td>${fmtBytes(r.bytes)}</td>
+          <td>${r.swap && r.swap !== "noop" ? `<span class="swap-evict">${r.swap}${r.evicted ? " " + r.evicted : ""}</span>` : (r.swap || "")}</td>
+        </tr>`).join("");
+    }
+  } catch (e) {
+    document.getElementById("lastUpdate").textContent = `error: ${e.message}`;
+  }
+}
+
+tick();
+setInterval(tick, REFRESH_MS);
+</script>
+</body>
+</html>

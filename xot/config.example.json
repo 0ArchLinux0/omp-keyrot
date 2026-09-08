@@ -1,0 +1,6 @@
+{
+  "total_keys": 14,
+  "strict_rotate": true,
+  "cooldown_seconds": 28800,
+  "auto_pick_on_429": true
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=kakao-bot /v1/chat on :7862
+After=network.target omp-orchestrator.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code_repo/omp-keyrot/kakao-bot
+Environment=HOME=%h
+ExecStart=/usr/bin/python3 kakao_bot_server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=llm-orchestrator (OpenAI-compatible local router)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code_repo/omp-keyrot/llm-orchestrator
+Environment=HOME=%h
+EnvironmentFile=-%h/code_repo/omp-keyrot/llm-orchestrator/.env
+ExecStart=/usr/bin/node src/server.js
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

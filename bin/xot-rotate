@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# xot-rotate — simplest possible key rotator.
+# Rule: (current+1) % N every request.
+# On real-daily-limit 429: mark key as cooling (skip until cooldown expires).
+# On transient 429: rotate normally, no skip.
+#
+# State file: /home/physics-lab/.local/daemon/xot/state
+#   ACTIVE_IDX=N
+#   ROTATED_AT=<epoch>
+#   COOL_<fingerprint>=<epoch>   (key is cooling until this epoch)
+#
+# On real daily-limit 429, call: xot-rotate cool <fingerprint>
+
+XOT_HOME="${XOT_HOME:-$HOME/.local/daemon/xot}"
+KEY_FILE="${XOT_KEY_FILE:-$XOT_HOME/keys}"
+STATE_FILE="${XOT_STATE_FILE:-$XOT_HOME/state}"
+COOL_SECS=${COOL_SECS:-28800}  # 8h default (daily limit)
+
+# ---- helper: load state into vars ---------------------------------------
+state_load() {
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    source <(grep -E '^(ACTIVE_IDX|ROTATED_AT|COOL_)=' "$STATE_FILE" 2>/dev/null)
+  fi
+  ACTIVE_IDX=${ACTIVE_IDX:-0}
+  ACTIVE_IDX=$(( 10#$ACTIVE_IDX ))
+}
+
+# ---- helper: write ACTIVE_IDX + ROTATED_AT, keep COOL_ entries ----------
+state_save() {
+  local idx=$1 now
+  now=$(date +%s)
+  {
+    echo "ACTIVE_IDX=$idx"
+    echo "ROTATED_AT=$now"
+    # Re-emit all existing COOL_ entries that haven't expired
+    if [ -f "$STATE_FILE" ]; then
+      grep -E '^COOL_' "$STATE_FILE" 2>/dev/null | while IFS= read -r line; do
+        val="${line#*=}"
+        if [ "$val" -gt "$now" ] 2>/dev/null; then
+          echo "$line"
+        fi
+      done
+    fi
+  } > /tmp/xot_state.tmp && mv /tmp/xot_state.tmp "$STATE_FILE"
+}
+
+# ---- helper: add a cooling entry ----------------------------------------
+state_cool() {
+  local fp=$1 now
+  now=$(date +%s)
+  local until=$(( now + COOL_SECS ))
+  [ -n "${2:-}" ] && [ "${2}" -gt 0 ] && until="${2}"
+  # Add or update COOL_ entry
+  if [ -f "$STATE_FILE" ]; then
+    # Remove old entry for this fingerprint
+    grep -v "^COOL_${fp}=" "$STATE_FILE" > /tmp/xot_state.tmp && mv /tmp/xot_state.tmp "$STATE_FILE"
+  fi
+  echo "COOL_${fp}=${until}" >> "$STATE_FILE"
+}
+
+# ---- 429 classifier -----------------------------------------------------
+# Returns 0 = real daily-limit (should cool), 1 = transient/other
+classify_429() {
+  # Feed response body / headers via stdin
+  # Real daily limit markers: limit_rpd, limit_source=openrouter_daily_limit,
+  # openrouter_shared_capacity (if same key was used heavily)
+  # Provider/transient: 502, 503, 429 without those markers
+  local body
+  body=$(cat 2>/dev/null)
+
+  case "$body" in
+    *limit_rpd*)   return 0 ;;
+    *limit_source=openrouter_daily_limit*) return 0 ;;
+    *openrouter_daily_limit*) return 0 ;;
+    *)             return 1 ;;
+  esac
+}
+
+# ---- subcommand: cool <fingerprint> ------------------------------------
+do_cool() {
+  local fp=$1
+  [ -z "$fp" ] && { echo "usage: xot-rotate cool <fingerprint>" >&2; exit 1; }
+  state_load
+  state_cool "$fp"
+  echo "xot-rotate: cooled key $fp until $(date -d @"$(date +%s)"" +%H:%M:%S" 2>/dev/null || date)" >&2
+}
+
+# ---- subcommand: status -------------------------------------------------
+do_status() {
+  state_load
+  local now
+  now=$(date +%s)
+  echo "ACTIVE_IDX=$ACTIVE_IDX"
+  echo "ROTATED_AT=${ROTATED_AT:-?}"
+  echo "COOL_SECS=$COOL_SECS"
+  echo "--- cooling keys ---"
+  if [ -f "$STATE_FILE" ]; then
+    grep '^COOL_' "$STATE_FILE" 2>/dev/null | while IFS= read -r line; do
+      fp="${line%%=*}" val="${line#*=}"
+      remain=$(( val - now ))
+      if [ "$remain" -gt 0 ]; then
+        echo "  $fp: cools in ${remain}s"
+      fi
+    done
+  fi
+}
+
+# ---- main: pick ---------------------------------------------------------
+do_pick() {
+  if [ ! -r "$KEY_FILE" ]; then
+    echo "xot-rotate: no keys file: $KEY_FILE" >&2
+    exit 1
+  fi
+
+  mapfile -t KEYS < <(grep -vE '^#|^[[:space:]]*$' "$KEY_FILE")
+  N=${#KEYS[@]}
+  [ "$N" -eq 0 ] && { echo "xot-rotate: no keys" >&2; exit 1; }
+
+  state_load
+  local now
+  now=$(date +%s)
+
+  # Find next non-cooling key starting from (ACTIVE_IDX+1)
+  local start=$(( (ACTIVE_IDX + 1) % N ))
+  local idx=$start
+  local found=0
+
+  for i in $(seq 0 $(( N - 1 ))); do
+    local fp
+    fp=$(echo -n "${KEYS[$idx]}" | sha256sum | awk '{print $1}' | cut -c1-16)
+    local cool_ts
+    cool_ts=$(grep "^COOL_${fp}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2)
+    if [ -z "$cool_ts" ] || [ "$cool_ts" -le "$now" ] 2>/dev/null; then
+      found=1
+      break
+    fi
+    idx=$(( (idx + 1) % N ))
+  done
+
+  if [ "$found" -eq 0 ]; then
+    echo "xot-rotate: all keys cooling — forcing next (ignore cooldown)" >&2
+    idx=$start
+  fi
+
+  local last_idx=$ACTIVE_IDX
+  local key="${KEYS[$idx]}"
+
+  state_save "$idx"
+
+  echo "export OPENROUTER_API_KEY='${key}'"
+  if [ "$idx" != "$last_idx" ]; then
+    echo "xot-rotate: key #$last_idx -> #$idx (of $N)" >&2
+  else
+    echo "xot-rotate: active key #$idx (of $N)" >&2
+  fi
+}
+
+# ---- entry point --------------------------------------------------------
+CMD="${1:-pick}"
+case "$CMD" in
+  cool)   shift; do_cool "$@" ;;
+  status) do_status ;;
+  pick)   do_pick ;;
+  *)      echo "usage: xot-rotate {pick|cool <fp>|status}" >&2; exit 1 ;;
+esac

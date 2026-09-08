@@ -1,0 +1,13 @@
+.env
+.env.local
+.env.*
+!.env.example
+node_modules/
+__pycache__/
+*.pyc
+.local/daemon/xot/keys
+.local/daemon/xot/state
+.local/daemon/xot/leases
+xot/keys
+xot/state
+*.log
