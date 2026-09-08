@@ -27,23 +27,58 @@ Does **not** vendor the `omp` binary (200MB). Install omp yourself, then overlay
                     └──────────────────────┘
 ```
 
-## Clone install
+## Clone install (Linux / macOS / Windows)
+
+Same repo, same overlay. `omp` itself is installed separately on each OS.
 
 ```bash
-git clone git@github.com:0ArchLinux0/omp-keyrot.git
+git clone https://github.com/0ArchLinux0/omp-keyrot.git
 cd omp-keyrot
-bash scripts/install.sh
-# edit ~/.local/daemon/xot/keys   (one sk-or-v1-... per line)
+bash scripts/install.sh          # Linux / macOS
+# edit ~/.local/daemon/xot/keys  (one sk-or-v1-... per line)
 xot status
 ```
 
-Windows:
+Windows (PowerShell):
 
 ```powershell
-git clone git@github.com:0ArchLinux0/omp-keyrot.git
+git clone https://github.com/0ArchLinux0/omp-keyrot.git
 cd omp-keyrot
 powershell -File scripts/install.ps1
+# fill $env:USERPROFILE\.local\daemon\xot\keys
 ```
+
+## Update (all devices)
+
+Re-run install after `git pull`. Existing `keys` / `state` / `leases` are **not** overwritten.
+
+```bash
+cd omp-keyrot && bash scripts/update.sh          # Linux / macOS
+# then restart omp / pi so extensions reload
+```
+
+```powershell
+cd omp-keyrot; powershell -File scripts/update.ps1
+```
+
+## What syncs vs what stays local
+
+| Thing | Sync via git? | Why |
+|-------|----------------|-----|
+| `bin/xot-rotate`, pi-extensions, orchestrator, kakao-bot | **Yes** | version of this overlay |
+| `xot/config.example.json` | **Yes** (example only) | rotation policy template |
+| `~/.local/daemon/xot/keys` | **No** | OpenRouter secrets |
+| `~/.local/daemon/xot/state` | **No** | live `ACTIVE_IDX` + cooling |
+| `~/.local/daemon/xot/leases` | **No** | per-window / per-machine claims |
+| `llm-orchestrator/.env` | **No** | host-specific (Ollama URL, VRAM) |
+
+**Code/version:** git is the source of truth. Pull + `update.sh` on each box.
+
+**Key list:** copy `keys` once (USB, 1Password, Tailscale `scp`). Same file on every device is fine. Do **not** commit it.
+
+**Rotation state:** keep **per machine**. If two boxes share `state`, they fight over the same `ACTIVE_IDX` and 429-cool the same fingerprints. `xot.ts` already leases keys per process; independent `state` files is the intended model.
+
+Optional: sync **only** `keys` with Syncthing/iCloud, never `state`/`leases`.
 
 ## What gets installed
 

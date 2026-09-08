@@ -27,10 +27,13 @@ if command -v systemctl >/dev/null 2>&1 && [ -d "$HOME/.config" ]; then
   systemctl --user daemon-reload || true
 fi
 
+# Never overwrite an existing keyring or rotation state.
 if [ ! -f "$HOME/.local/daemon/xot/keys" ]; then
   cp "$ROOT/xot/keys.example" "$HOME/.local/daemon/xot/keys"
   chmod 600 "$HOME/.local/daemon/xot/keys"
   echo "Put OpenRouter keys (one per line) in: $HOME/.local/daemon/xot/keys"
+else
+  echo "Keeping existing $HOME/.local/daemon/xot/keys (not overwritten)"
 fi
 
 # PATH
