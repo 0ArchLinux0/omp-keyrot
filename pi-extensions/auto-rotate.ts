@@ -363,19 +363,11 @@ export default function (pi: ExtensionAPI) {
   // HTTP-level rate-limit / blocked / 403 / 401
   pi.on("after_provider_response", async (event, ctx) => {
     if (strictRotate) {
-      const body = (event as any)?.response?.body ?? (event as any)?.body ?? "";
-      const perKeyDaily = /free-models-per-day|openrouter_free_tier_daily/i.test(String(body));
-      if (perKeyDaily && event.status === 429) {
-        tryRotateOnError(`status ${event.status}`, ctx as any, {
-          kind: "daily",
-          http: event.status,
-          model: (event as any)?.response?.model,
-          body: String(body),
-        });
-        return;
-      }
+      // xot.ts handles per-key daily 429 + auto-continue; avoid double rotation here.
       if (event.status === 429 || event.status === 403 || event.status === 520 || event.status === 401) {
-        console.error(`xot: strict-rotate active, NOT rotating on ${event.status} (xot.ts handles per-key daily 429)`);
+        const body = String((event as any)?.response?.body ?? (event as any)?.body ?? "");
+        if (/free-models-per-day|openrouter_free_tier_daily/i.test(body)) return;
+        console.error(`xot: strict-rotate active, NOT rotating on ${event.status}`);
       }
       return;
     }
@@ -412,13 +404,7 @@ export default function (pi: ExtensionAPI) {
     // fall through to key rotation, causing the #1 <-> #2 ping-pong the
     // user reported.
     if (strictRotate) {
-      if (typeof errMsg === "string" && /free-models-per-day|openrouter_free_tier_daily/i.test(errMsg)) {
-        tryRotateOnError("per-key daily cap", ctx as any, {
-          kind: "daily",
-          http: msg?.http ?? 429,
-          body: errMsg,
-        });
-      }
+      // xot.ts turn_end / auto_retry_end handles per-key daily cap + continue.
       return;
     }
 

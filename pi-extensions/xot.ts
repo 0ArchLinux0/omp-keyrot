@@ -673,6 +673,7 @@ export default function (pi: any) {
   let cycleAttempts = 0;
   let cycleModel: string | null = null;
   let dailyRotateAttempts = 0;
+  let scheduledContinueTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Retry / continue state (in-memory mirror of the file)
   let lastUserPrompt: string | null = null;        // most recent user text
@@ -923,8 +924,12 @@ export default function (pi: any) {
     const insufficientBalance = typeof errMsg === "string" &&
       /insufficient[ _-]?(balance|credit|quota)|payment required|status 402/i.test(errMsg);
 
-    if (perKeyDailyCap && msg.stopReason === "error" && !recentlyRotated()) {
-      handlePerKeyDaily429(ctx, null);
+    if (perKeyDailyCap && msg.stopReason === "error") {
+      if (!recentlyRotated()) {
+        handlePerKeyDaily429(ctx, null);
+      } else if (loadRetryState()?.needsRetry) {
+        scheduleAutoContinue(ctx, 400);
+      }
       return;
     }
 
@@ -1044,8 +1049,12 @@ export default function (pi: any) {
   pi.on("auto_retry_end", (event: any, ctx: any) => {
     if (!event || event.success) return;
     const errMsg: string = (event.finalError ?? "") as string;
-    if (PER_KEY_DAILY_RE.test(errMsg) && !recentlyRotated()) {
-      handlePerKeyDaily429(ctx, null);
+    if (PER_KEY_DAILY_RE.test(errMsg)) {
+      if (!recentlyRotated()) {
+        handlePerKeyDaily429(ctx, null);
+      } else if (loadRetryState()?.needsRetry) {
+        scheduleAutoContinue(ctx, 400);
+      }
       return;
     }
     // Only act on transport-level failures. 4xx errors are already
@@ -1104,17 +1113,7 @@ export default function (pi: any) {
         `xot: auto-resuming "${preview}" (use /xot retry-cancel to abort)`,
         "warning",
       );
-      setTimeout(async () => {
-        // Re-check the marker hasn't been cancelled in the meantime
-        const cur = loadRetryState();
-        if (!cur || !cur.needsRetry) return;
-        // Also bail if the user is mid-typing (don't clobber their input)
-        // We can't easily detect this from the extension API, but
-        // sendUserMessage is no-op if the editor is non-empty per pi's
-        // design. So just try — if it fails silently, the user can
-        // press Enter.
-        await doContinue(ctx);
-      }, retryConfig.autoContinueDelayMs);
+      scheduleAutoContinue(ctx, retryConfig.autoContinueDelayMs);
       return;
     }
     const preview = state.prompt.length > 60
@@ -1130,6 +1129,20 @@ export default function (pi: any) {
       ctx.ui.notify("xot: retry cancelled. Type `continue` later to retry.", "info");
     }
   });
+
+  function scheduleAutoContinue(ctx: any, delayMs?: number): void {
+    const delay = delayMs ?? retryConfig.autoContinueDelayMs;
+    const state = loadRetryState();
+    if (!state?.needsRetry && !lastUserPrompt) return;
+    if (scheduledContinueTimer) return;
+    scheduledContinueTimer = setTimeout(async () => {
+      scheduledContinueTimer = null;
+      const cur = loadRetryState();
+      if (!cur?.needsRetry) return;
+      if (activeKey) applyOpenRouterKey(activeKey);
+      await doContinue(ctx);
+    }, delay);
+  }
 
   async function doContinue(ctx: any): Promise<boolean> {
     const state = loadRetryState();
@@ -1218,6 +1231,7 @@ export default function (pi: any) {
     limitedCount = 0;
     if (lastUserPrompt) {
       saveRetryMarker("per-key daily cap (free-models-per-day)", lastUserPrompt, ctx);
+      scheduleAutoContinue(ctx, 400);
     }
   }
 
