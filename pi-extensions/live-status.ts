@@ -153,17 +153,38 @@ function clearCustomChrome(ctx: any) {
   }
 }
 
+const LIVE_STATUS_BRIDGE = Symbol.for("live-status.bridge");
+
 export default function (pi: ExtensionAPI) {
+  let lastCtx: any = null;
+
   function applyFooter(ctx: any) {
-    clearCustomChrome(ctx);
-    ctx.ui.setStatus?.("xot-key", xotFooter());
+    if (ctx) lastCtx = ctx;
+    const target = ctx ?? lastCtx;
+    if (!target?.ui) return;
+    clearCustomChrome(target);
+    target.ui.setStatus?.("xot-key", xotFooter());
   }
+
+  // Expose refresh for xot.ts to call right after key rotation (no polling).
+  (globalThis as any)[LIVE_STATUS_BRIDGE] = {
+    refresh: (ctx?: any) => {
+      try { applyFooter(ctx ?? lastCtx); } catch {}
+    },
+  };
 
   pi.on("turn_start", async (_event, ctx) => { applyFooter(ctx); });
   pi.on("agent_end", async (_event, ctx) => { applyFooter(ctx); });
   pi.on("agent_settled", async (_event, ctx) => { applyFooter(ctx); });
   pi.on("turn_end", async (_event, ctx) => { applyFooter(ctx); });
   pi.on("session_start", async (_event, ctx) => { applyFooter(ctx); });
+  // Key can change before the turn footer hooks fire (strict rotate / 429 retry).
+  pi.on("before_agent_start", async (_event, ctx) => { applyFooter(ctx); });
+  pi.on("before_provider_request", async (_event, ctx) => { applyFooter(ctx); });
+  pi.on("after_provider_response", async (event, ctx) => {
+    // Cheap: one state-file read; refresh after errors when xot may have rotated.
+    if (event?.status && event.status >= 400) applyFooter(ctx);
+  });
 
   pi.registerCommand("status", {
     description: "Show XOT key in the official footer (and dump details via notify)",

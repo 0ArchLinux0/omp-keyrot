@@ -568,6 +568,12 @@ function pickKeyInProcess(): string | null {
   return picked;
 }
 
+function refreshLiveStatus(ctx?: any): void {
+  try {
+    (globalThis as any)[Symbol.for("live-status.bridge")]?.refresh?.(ctx);
+  } catch {}
+}
+
 export default function (pi: any) {
   // Safe wrappers: xot's event handlers may be called in tests with
   // a stub ctx, or in some real-pi versions with ctx being optional.
@@ -709,6 +715,7 @@ export default function (pi: any) {
       console.error(`xot: rotated for new turn — ${oldShort}… → ${newShort}…`);
     }
     if (activeKey) applyOpenRouterKey(activeKey);
+    refreshLiveStatus(ctx);
     if (originalDefaultModel && !manualModelOverride && (ctx as any)?.modelRegistry?.find) {
       const cur = (ctx as any).model;
       const curName = cur ? `${cur.provider}/${cur.id}` : null;
@@ -1203,6 +1210,7 @@ export default function (pi: any) {
         `xot: daily cap on ${from} → trying ${mask(next)} (${dailyRotateAttempts}/${poolSize})`,
         "warning",
       );
+      refreshLiveStatus(ctx);
     } else {
       safeNotify(ctx, "xot: no next key available after daily cap", "error");
       return;
@@ -1254,8 +1262,10 @@ export default function (pi: any) {
     // 3) pickKey returned a real key. If it changed, ONE clear message.
     if (next !== activeKey) {
       activeKey = next;
+      applyOpenRouterKey(next);
       clearCoolCache();
       lastRotationTime = Date.now();
+      refreshLiveStatus(ctx);
       const oldShort = mask(activeKey);
       ctx.ui.notify(`xot: rotated — key switched, continuing`, "info");
       // setStatus disabled: rotated
