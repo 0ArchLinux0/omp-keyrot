@@ -928,7 +928,7 @@ export default function (pi: any) {
       if (!recentlyRotated()) {
         handlePerKeyDaily429(ctx, null);
       } else if (loadRetryState()?.needsRetry) {
-        scheduleAutoContinue(ctx, 400);
+        scheduleAutoContinue(ctx, 900);
       }
       return;
     }
@@ -1053,7 +1053,7 @@ export default function (pi: any) {
       if (!recentlyRotated()) {
         handlePerKeyDaily429(ctx, null);
       } else if (loadRetryState()?.needsRetry) {
-        scheduleAutoContinue(ctx, 400);
+        scheduleAutoContinue(ctx, 900);
       }
       return;
     }
@@ -1231,7 +1231,7 @@ export default function (pi: any) {
     limitedCount = 0;
     if (lastUserPrompt) {
       saveRetryMarker("per-key daily cap (free-models-per-day)", lastUserPrompt, ctx);
-      scheduleAutoContinue(ctx, 400);
+      // Continue is scheduled from turn_end / auto_retry_end after omp retry gives up.
     }
   }
 
