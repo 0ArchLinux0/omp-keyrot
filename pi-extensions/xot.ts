@@ -248,7 +248,34 @@ function isCooling(key: string): boolean {
 }
 function clearCoolCache() { coolCache = { mtimeMs: 0, size: 0, map: new Map() }; coolLastCheck = 0; }
 
+function coolKey(key: string, untilEpoch: number): void {
+  try {
+    const fp = fingerprint(key);
+    let state = existsSync(XOT_STATE_FILE) ? readFileSync(XOT_STATE_FILE, "utf8") : "";
+    const re = new RegExp(`^COOL_${fp}=\\d+\\n?`, "m");
+    const newLine = `COOL_${fp}=${untilEpoch}\n`;
+    state = re.test(state) ? state.replace(re, newLine) : state + newLine;
+    const tmp = XOT_STATE_FILE + ".tmp";
+    writeFileSync(tmp, state);
+    renameSync(tmp, XOT_STATE_FILE);
+    clearCoolCache();
+  } catch {}
+}
+
 let limitedCount = 0;
+
+const PER_KEY_DAILY_RE = /free-models-per-day|openrouter_free_tier_daily/i;
+
+function extractErrorBody(event: any): string {
+  const raw = event?.response?.body ?? event?.body ?? event?.error ?? "";
+  if (typeof raw === "string") return raw;
+  try { return JSON.stringify(raw ?? ""); } catch { return ""; }
+}
+
+function isPerKeyDaily429(event: any, extraBody?: string): boolean {
+  const body = (extraBody ?? extractErrorBody(event)).toLowerCase();
+  return PER_KEY_DAILY_RE.test(body);
+}
 
 function parseRetryAfter(v: unknown): number | null {
   if (typeof v !== "string" || !v) return null;
@@ -639,6 +666,7 @@ export default function (pi: any) {
   // (c) after we switch models.
   let cycleAttempts = 0;
   let cycleModel: string | null = null;
+  let dailyRotateAttempts = 0;
 
   // Retry / continue state (in-memory mirror of the file)
   let lastUserPrompt: string | null = null;        // most recent user text
@@ -672,6 +700,7 @@ export default function (pi: any) {
   pi.on("before_agent_start", async (_event: any, ctx: any) => {
     cycleAttempts = 0;
     cycleModel = null;
+    dailyRotateAttempts = 0;
     const next = pickKey();
     if (next && next !== activeKey) {
       const oldShort = mask(activeKey);
@@ -771,11 +800,19 @@ export default function (pi: any) {
   pi.on("after_provider_response", (event: any, ctx: any) => {
     const h = event.headers ?? {};
     if (event.status === 429) {
+      const body = extractErrorBody(event);
       let ra = parseRetryAfter(h["retry-after"]);
       // OpenRouter puts the daily reset epoch in X-RateLimit-Reset when
       // the failure is a daily-quota exhaustion. Treat that as a much
       // longer backoff than the per-minute Retry-After.
       const dailyResetSec = parseRetryAfter(h["x-ratelimit-reset"]);
+
+      if (isPerKeyDaily429(event, body)) {
+        limitedCount++;
+        handlePerKeyDaily429(ctx, ra ?? dailyResetSec);
+        return;
+      }
+
       if (dailyResetSec && dailyResetSec > 3600 && (!ra || dailyResetSec > ra)) {
         // Daily pool exhausted. Don't rotate keys; just back off the
         // model until the daily reset. The user must wait or switch
@@ -874,8 +911,15 @@ export default function (pi: any) {
     const msg: any = event?.message;
     if (!msg) return;
     const errMsg: string = msg.errorMessage ?? "";
+    const perKeyDailyCap =
+      typeof errMsg === "string" && PER_KEY_DAILY_RE.test(errMsg);
     const insufficientBalance = typeof errMsg === "string" &&
       /insufficient[ _-]?(balance|credit|quota)|payment required|status 402/i.test(errMsg);
+
+    if (perKeyDailyCap && msg.stopReason === "error" && !recentlyRotated()) {
+      handlePerKeyDaily429(ctx, null);
+      return;
+    }
 
     // Detect "broken turn": empty content (no text and no tool calls) AND
     // a rotation just happened. The rotation is signalled by limitedCount
@@ -993,6 +1037,10 @@ export default function (pi: any) {
   pi.on("auto_retry_end", (event: any, ctx: any) => {
     if (!event || event.success) return;
     const errMsg: string = (event.finalError ?? "") as string;
+    if (PER_KEY_DAILY_RE.test(errMsg) && !recentlyRotated()) {
+      handlePerKeyDaily429(ctx, null);
+      return;
+    }
     // Only act on transport-level failures. 4xx errors are already
     // handled by after_provider_response. 5xx are typically transient
     // and the server will recover on its own; we don't want to mark
@@ -1124,6 +1172,45 @@ export default function (pi: any) {
 
   function recentlyRotated(): boolean {
     return Date.now() - lastRotationTime < 30_000;
+  }
+
+  function handlePerKeyDaily429(ctx: any, cooldownSec: number | null | undefined): void {
+    const poolSize = getPoolSize();
+    dailyRotateAttempts++;
+    if (dailyRotateAttempts > poolSize) {
+      safeNotify(
+        ctx,
+        `xot: all ${poolSize} keys hit daily free-model cap — wait for UTC reset or add credits`,
+        "error",
+      );
+      return;
+    }
+    const prev = activeKey;
+    if (prev) {
+      const until = Math.floor(Date.now() / 1000) +
+        (cooldownSec && cooldownSec > 0 ? cooldownSec : 6 * 3600);
+      coolKey(prev, until);
+    }
+    const next = pickKey();
+    if (next) {
+      activeKey = next;
+      applyOpenRouterKey(next);
+      clearCoolCache();
+      lastRotationTime = Date.now();
+      const from = prev ? mask(prev) : "?";
+      safeNotify(
+        ctx,
+        `xot: daily cap on ${from} → trying ${mask(next)} (${dailyRotateAttempts}/${poolSize})`,
+        "warning",
+      );
+    } else {
+      safeNotify(ctx, "xot: no next key available after daily cap", "error");
+      return;
+    }
+    limitedCount = 0;
+    if (lastUserPrompt) {
+      saveRetryMarker("per-key daily cap (free-models-per-day)", lastUserPrompt, ctx);
+    }
   }
 
   function extractAssistantText(msg: any): string {

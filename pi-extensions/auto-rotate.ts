@@ -363,9 +363,19 @@ export default function (pi: ExtensionAPI) {
   // HTTP-level rate-limit / blocked / 403 / 401
   pi.on("after_provider_response", async (event, ctx) => {
     if (strictRotate) {
-      // Log only; do not call tryRotateOnError.
+      const body = (event as any)?.response?.body ?? (event as any)?.body ?? "";
+      const perKeyDaily = /free-models-per-day|openrouter_free_tier_daily/i.test(String(body));
+      if (perKeyDaily && event.status === 429) {
+        tryRotateOnError(`status ${event.status}`, ctx as any, {
+          kind: "daily",
+          http: event.status,
+          model: (event as any)?.response?.model,
+          body: String(body),
+        });
+        return;
+      }
       if (event.status === 429 || event.status === 403 || event.status === 520 || event.status === 401) {
-        console.error(`xot: strict-rotate active, NOT rotating on ${event.status} (next pick will advance automatically)`);
+        console.error(`xot: strict-rotate active, NOT rotating on ${event.status} (xot.ts handles per-key daily 429)`);
       }
       return;
     }
@@ -401,7 +411,16 @@ export default function (pi: ExtensionAPI) {
     // "insufficient balance" substring and let other shared-pool shapes
     // fall through to key rotation, causing the #1 <-> #2 ping-pong the
     // user reported.
-    if (strictRotate) return;
+    if (strictRotate) {
+      if (typeof errMsg === "string" && /free-models-per-day|openrouter_free_tier_daily/i.test(errMsg)) {
+        tryRotateOnError("per-key daily cap", ctx as any, {
+          kind: "daily",
+          http: msg?.http ?? 429,
+          body: errMsg,
+        });
+      }
+      return;
+    }
 
     const insufficientBalance = typeof errMsg === "string" && INSUFFICIENT_BALANCE_RE.test(errMsg);
     const isSharedPool = typeof errMsg === "string" && SHARED_POOL_RE.test(errMsg);
