@@ -576,14 +576,17 @@ do_probe() {
 do_classify() {
   local text="${*:-}"
   text=$(echo "$text" | tr '[:upper:]' '[:lower:]')
-  if echo "$text" | grep -qE 'shared[_-]?pool|provider[_-]?exhausted|upstream'; then
+  if echo "$text" | grep -qE 'shared[ _-]?pool|provider[ _-]?exhausted|upstream[ _-]?provider[ _-]?shared'; then
     echo "shared"
-  elif echo "$text" | grep -qE '401|403|unauthorized|invalid api'; then
+  elif echo "$text" | grep -qE 'unauthorized|invalid api|authentication required|\bhttp 401\b|\bhttp 403\b'; then
     echo "auth"
-  elif echo "$text" | grep -qE 'free-models-per-day|openrouter_free_tier_daily|limit_rpd|high-balance'; then
+  elif echo "$text" | grep -qE 'free-models-per-day|openrouter_free_tier_daily|limit_rpd|high-balance|add 10 credits'; then
+    echo "daily"
+  elif echo "$text" | grep -qE 'retry\.maxdelayms|exceeds retry\.maxdelay|provider requested [0-9]+ms wait'; then
     echo "daily"
   elif echo "$text" | grep -qE '429|rate limit'; then
-    echo "transient"
+    # :free default — empty-body / header-only 429 is a per-key daily cap.
+    echo "daily"
   else
     echo "other"
   fi

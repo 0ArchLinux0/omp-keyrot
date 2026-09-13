@@ -28,9 +28,19 @@ check() {
 c1=$("$ROT" classify "429 Rate limit exceeded: free-models-per-day-high-balance")
 c2=$("$ROT" classify "upstream provider shared pool")
 c3=$("$ROT" classify "free-models-per-day. Add 10 credits")
+c4=$("$ROT" classify "429")
+c5=$("$ROT" classify "Retry failed after 1 attempts: Provider requested 13265929ms wait, exceeds retry.maxDelayMs (300000ms). Original error: 429 Rate limit exceeded: free-models-per-day. Add 10 credits")
+c6=$("$ROT" classify "Add 10 credits to unlock 1000 free model requests per day")
+c7=$("$ROT" classify "HTTP 429")
+c8=$("$ROT" classify "some unrelated timeout")
 check classify-high '[ "$c1" = daily ]'
 check classify-shared '[ "$c2" = shared ]'
 check classify-add10 '[ "$c3" = daily ]'
+check classify-empty-429 '[ "$c4" = daily ]'
+check classify-maxdelay-composite '[ "$c5" = daily ]'
+check classify-add10-only '[ "$c6" = daily ]'
+check classify-http-429 '[ "$c7" = daily ]'
+check classify-other '[ "$c8" = other ]'
 
 out=$("$ROT" set 3 2>/dev/null)
 suf=$(echo "$out" | grep OPENROUTER_API_KEY | sed -n "s/.*'\(.*\)'/\1/p" | tail -c 5 | tr -d "'")
@@ -116,6 +126,27 @@ check prune-dead '! echo "$st" | grep -q dead-sess'
 
 lk=$("$ROT" locks)
 check locks-has-sess 'echo "$lk" | grep -q sess-b'
+
+# Cooling this session's key must skip it on next acquire (429 rotate path)
+"$ROT" acquire sess-d "$PID" >/dev/null 2>&1 || true
+kd=$("$ROT" acquire sess-d "$PID" 2>/dev/null | grep OPENROUTER | sed -n "s/.*'\(.*\)'/\1/p")
+fpd=$(printf '%s' "$kd" | sha256sum | awk '{print $1}' | cut -c1-16)
+"$ROT" cool "$fpd" "$(( $(date +%s) + 3600 ))" >/dev/null
+kd2=$("$ROT" acquire sess-d "$PID" 2>/dev/null | grep OPENROUTER | sed -n "s/.*'\(.*\)'/\1/p")
+check acquire-skips-own-cool '[ -n "$kd2" ] && [ "$kd2" != "$kd" ]'
+id_d=$(python3 "$LOCK" get sess-d)
+id_a=$(python3 "$LOCK" get sess-a || echo -1)
+check acquire-skip-cool-leaves-a '[ "$id_a" != "$id_d" ]'
+
+# bump after cool must not steal another live session
+ia_pre=$(python3 "$LOCK" get sess-a || echo -1)
+ib_pre=$(python3 "$LOCK" get sess-b || echo -1)
+bump_d=$("$ROT" bump sess-d "$PID" 2>/dev/null | grep OPENROUTER | sed -n "s/.*'\(.*\)'/\1/p" || true)
+ia_post=$(python3 "$LOCK" get sess-a || echo -1)
+ib_post=$(python3 "$LOCK" get sess-b || echo -1)
+check bump-after-cool-leaves-a '[ "$ia_pre" = "$ia_post" ]'
+check bump-after-cool-leaves-b '[ "$ib_pre" = "$ib_post" ]'
+check bump-after-cool-changed '[ -z "$bump_d" ] || [ "$bump_d" != "$kd" ]'
 
 "$ROT" release sess-a >/dev/null
 "$ROT" release sess-b >/dev/null

@@ -4,6 +4,13 @@
  * Multi-session: each OMP session auto-acquires an exclusive key via flock+registry.
  * /key N and /key-rotate affect THIS session only. /key N refuses if another
  * live session holds that key (/key N steal to override).
+ *
+ * 429 handling (2026-09-14):
+ *   after_provider_response has status+headers only (no body). Empty-body 429
+ *   on :free is a per-key daily cap — cool this session's key and bump.
+ *   OMP aborts when retry-after-ms > retry.maxDelayMs; turn_end / agent_end
+ *   parse that composite error and rotate the same way, then auto-continue.
+ *   acquire() never silently reuses a cooled env key.
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -16,12 +23,17 @@ const XOT_ROTATE = join(homedir(), ".local", "bin", "xot-rotate");
 const LAST_429 = join(homedir(), ".config", "openrouter", "last_429.json");
 const OPENROUTER_PROVIDERS = ["openrouter", "openrouter-free-auto"];
 const HEARTBEAT_SECS = 60;
+const ROTATE_DEBOUNCE_MS = 1500;
+const MAX_AUTO_CONTINUES = 8;
 
-const PER_KEY_DAILY_RE =
-  /free-models-per-day|openrouter_free_tier_daily|limit_rpd|high-balance/i;
-const SHARED_POOL_RE =
-  /shared[_-]?pool|upstream[_-]?provider[_-]?shared|provider[_-]?exhausted/i;
-const AUTH_RE = /401|403|unauthorized|invalid api[_ -]?key|authentication required/i;
+export const PER_KEY_DAILY_RE =
+  /free-models-per-day|openrouter_free_tier_daily|limit_rpd|high-balance|add 10 credits/i;
+export const SHARED_POOL_RE =
+  /shared[ _-]?pool|upstream[ _-]?provider[ _-]?shared|provider[ _-]?exhausted/i;
+export const AUTH_RE = /401|403|unauthorized|invalid api[_ -]?key|authentication required/i;
+export const MAX_DELAY_RE =
+  /retry\.maxdelayms|exceeds retry\.maxdelay|provider requested \d+ms wait/i;
+export const HTTP_429_RE = /\b429\b|rate limit exceeded/i;
 
 function fingerprint(key: string): string {
   return createHash("sha256").update(key).digest("hex").slice(0, 16);
@@ -36,37 +48,29 @@ function runXot(args: string[]): string {
 }
 
 function xotError(e: unknown): string {
-  const err = e as { stderr?: Buffer | string; message?: string };
-  const raw = err?.stderr;
-  const s = Buffer.isBuffer(raw)
-    ? raw.toString("utf8")
-    : String(raw ?? err?.message ?? e);
-  return s.trim();
+  if (e && typeof e === "object" && "stderr" in e) {
+    const err = e as { stderr?: string | Buffer; message?: string };
+    const s = typeof err.stderr === "string" ? err.stderr : err.stderr?.toString();
+    if (s?.trim()) return s.trim();
+    if (err.message) return err.message;
+  }
+  return e instanceof Error ? e.message : String(e);
 }
 
 function parseExportKey(out: string): string | null {
-  const m = out.match(/export OPENROUTER_API_KEY='([^']+)'/);
-  const key = m?.[1]?.trim() ?? null;
-  if (key) process.env.OPENROUTER_API_KEY = key;
-  return key;
+  const m = /export OPENROUTER_API_KEY='([^']+)'/.exec(out);
+  return m?.[1] ?? null;
 }
 
 function sessionIdFromCtx(ctx?: any, event?: any): string {
   const raw =
     ctx?.sessionId ??
-    ctx?.session?.sessionId ??
+    ctx?.session?.id ??
     event?.sessionId ??
-    (typeof ctx?.sessionManager?.getSessionFile === "function"
-      ? ctx.sessionManager.getSessionFile()
-      : "") ??
+    event?.session?.id ??
     process.env.XOT_SESSION_ID ??
-    process.env.OMP_SESSION_ID ??
     "";
-  const s = String(raw || "");
-  const uuid = s.match(
-    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
-  );
-  if (uuid) return uuid[0];
+  const s = String(raw).trim();
   if (s) return s;
   return `omp-pid-${process.pid}`;
 }
@@ -80,7 +84,9 @@ function acquireKey(sessionId: string): string | null {
     process.env.XOT_SESSION_ID = sessionId;
     return parseExportKey(out);
   } catch {
-    return process.env.OPENROUTER_API_KEY?.trim() || null;
+    // Do not fall back to a cooled/locked env key — that is how
+    // "No free key" still sent traffic and immediately 429'd again.
+    return null;
   }
 }
 
@@ -178,7 +184,7 @@ function providerFromEvent(event: any, ctx?: any): string {
   );
 }
 
-function extractBody(event: any): string {
+export function extractBody(event: any): string {
   const raw = event?.body ?? event?.text ?? event?.response?.body ?? event?.error ?? "";
   if (typeof raw === "string") return raw;
   try {
@@ -188,7 +194,7 @@ function extractBody(event: any): string {
   }
 }
 
-function extractHeaders(event: any): Record<string, string> {
+export function extractHeaders(event: any): Record<string, string> {
   const h = event?.headers ?? event?.response?.headers ?? {};
   if (h && typeof h === "object" && !Array.isArray(h)) {
     const out: Record<string, string> = {};
@@ -200,7 +206,7 @@ function extractHeaders(event: any): Record<string, string> {
   return {};
 }
 
-function parseResetEpoch(headers: Record<string, string>, body: string): number {
+export function parseResetEpoch(headers: Record<string, string>, body: string): number {
   const resetHdr = headers["x-ratelimit-reset"];
   if (resetHdr && /^\d+$/.test(resetHdr)) {
     const n = Number(resetHdr);
@@ -219,15 +225,61 @@ function parseResetEpoch(headers: Record<string, string>, body: string): number 
   return 0;
 }
 
-type ErrorClass = "daily" | "shared" | "auth" | "transient" | "other";
+export type ErrorClass = "daily" | "shared" | "auth" | "transient" | "other";
 
-function classifyError(status: number | undefined, body: string): ErrorClass {
-  const b = body.toLowerCase();
+/**
+ * Classify an OpenRouter :free error.
+ * after_provider_response has no body — HTTP 429 with empty body is daily.
+ * Shared-pool text is the only 429 that must NOT cool a key.
+ */
+export function classifyError(status: number | undefined, body: string): ErrorClass {
+  const b = (body || "").toLowerCase();
   if (status === 401 || status === 403 || AUTH_RE.test(b)) return "auth";
   if (SHARED_POOL_RE.test(b)) return "shared";
   if (PER_KEY_DAILY_RE.test(b)) return "daily";
-  if (status === 429) return "transient";
+  if (MAX_DELAY_RE.test(b) && (status === 429 || HTTP_429_RE.test(b) || /original error/i.test(b))) {
+    return "daily";
+  }
+  if (MAX_DELAY_RE.test(b)) return "daily";
+  if (status === 429 || HTTP_429_RE.test(b)) return "daily";
   return "other";
+}
+
+export function collectErrorText(event: any): string {
+  const parts: string[] = [];
+  const push = (v: unknown) => {
+    if (typeof v === "string" && v.trim()) parts.push(v);
+  };
+  push(extractBody(event));
+  push(event?.errorMessage);
+  push(event?.message?.errorMessage);
+  push(event?.finalError);
+  push(typeof event?.error === "string" ? event.error : "");
+  if (event?.status != null) parts.push(`HTTP ${event.status}`);
+  const h = extractHeaders(event);
+  for (const k of ["x-ratelimit-reset", "retry-after", "x-ratelimit-remaining", "x-ratelimit-limit"]) {
+    if (h[k]) parts.push(`${k}:${h[k]}`);
+  }
+  return parts.join("\n");
+}
+
+function messageErrorText(msg: any): string {
+  if (!msg) return "";
+  const parts: string[] = [];
+  const push = (v: unknown) => {
+    if (typeof v === "string" && v.trim()) parts.push(v);
+  };
+  push(msg.errorMessage);
+  push(typeof msg.error === "string" ? msg.error : "");
+  push(msg.stopReason);
+  push(msg.text);
+  if (Array.isArray(msg.content)) {
+    for (const part of msg.content) {
+      if (typeof part === "string") push(part);
+      else if (part?.type === "text") push(part.text);
+    }
+  }
+  return parts.join("\n");
 }
 
 function log429(event: any, kind: ErrorClass, key: string | null): void {
@@ -241,8 +293,9 @@ function log429(event: any, kind: ErrorClass, key: string | null): void {
           ts: Date.now() / 1000,
           kind,
           key: key ? maskKey(key) : null,
-          status: event?.status ?? event?.response?.status,
-          body_excerpt: extractBody(event).slice(0, 300),
+          status: event?.status ?? event?.response?.status ?? null,
+          headers: extractHeaders(event),
+          body_excerpt: collectErrorText(event).slice(0, 500),
         },
         null,
         2,
@@ -253,10 +306,27 @@ function log429(event: any, kind: ErrorClass, key: string | null): void {
   }
 }
 
+function userTextFromMessage(m: any): string {
+  if (!m) return "";
+  let text = "";
+  if (typeof m.content === "string") text = m.content;
+  else if (Array.isArray(m.content)) {
+    for (const part of m.content) {
+      if (typeof part === "string") text += part;
+      else if (part?.type === "text" && typeof part.text === "string") text += part.text;
+    }
+  }
+  return text.trim();
+}
+
 export default function (pi: ExtensionAPI) {
   let activeKey: string | null = null;
   let sessionId: string | null = null;
   let lastHeartbeat = 0;
+  let lastUserPrompt = "";
+  let pendingContinue = false;
+  let continueCount = 0;
+  let lastRotateAt = 0;
 
   function applyKey(key: string): void {
     process.env.OPENROUTER_API_KEY = key;
@@ -270,6 +340,11 @@ export default function (pi: ExtensionAPI) {
     } catch {
       /* provider may not exist yet */
     }
+  }
+
+  function dropStaleKey(): void {
+    activeKey = null;
+    delete process.env.OPENROUTER_API_KEY;
   }
 
   function ensureKey(ctx?: any): string | null {
@@ -289,6 +364,59 @@ export default function (pi: ExtensionAPI) {
     heartbeatKey(sessionId);
   }
 
+  function rotateOnCap(ctx: any, event: any, kind: ErrorClass): boolean {
+    if (kind !== "daily" && kind !== "auth") return false;
+    if (Date.now() - lastRotateAt < ROTATE_DEBOUNCE_MS) return false;
+    lastRotateAt = Date.now();
+
+    const prev = activeKey ?? process.env.OPENROUTER_API_KEY ?? null;
+    const sid = sessionId ?? sessionIdFromCtx(ctx, event);
+    sessionId = sid;
+    log429(event, kind, prev);
+    const body = collectErrorText(event);
+    const headers = extractHeaders(event);
+    if (prev) {
+      const until = kind === "daily" ? parseResetEpoch(headers, body) : 0;
+      coolKey(prev, until);
+    }
+    const next = bumpKey(sid) ?? acquireKey(sid);
+    if (next && next !== prev) {
+      applyKey(next);
+      resetAdvisor(ctx);
+      pendingContinue = true;
+      ctx.ui?.notify?.(
+        `key-rotate: ${kind} on ${maskKey(prev ?? "?")} -> ${maskKey(next)} (this session only)`,
+        "warning",
+      );
+      return true;
+    }
+    dropStaleKey();
+    pendingContinue = false;
+    ctx.ui?.notify?.(
+      `key-rotate: all keys daily-capped or locked — not reusing a cooled key. Wait for UTC reset or /key-status.`,
+      "error",
+    );
+    return false;
+  }
+
+  async function maybeAutoContinue(): Promise<void> {
+    if (!pendingContinue || !lastUserPrompt) return;
+    if (continueCount >= MAX_AUTO_CONTINUES) {
+      pendingContinue = false;
+      return;
+    }
+    pendingContinue = false;
+    continueCount += 1;
+    const prompt = lastUserPrompt;
+    try {
+      if (typeof (pi as any).sendUserMessage === "function") {
+        await (pi as any).sendUserMessage(prompt);
+      }
+    } catch {
+      /* user can /retry */
+    }
+  }
+
   pi.on("session_start", async (event: unknown, ctx: unknown) => {
     sessionId = sessionIdFromCtx(ctx, event);
     const key = acquireKey(sessionId);
@@ -302,16 +430,26 @@ export default function (pi: ExtensionAPI) {
     if (sessionId) releaseKey(sessionId);
     sessionId = null;
     activeKey = null;
+    pendingContinue = false;
+  });
+
+  pi.on("before_agent_start", async (event: any) => {
+    const prompt = typeof event?.prompt === "string" ? event.prompt.trim() : "";
+    if (prompt && prompt !== "continue" && prompt !== "c") {
+      lastUserPrompt = prompt;
+    }
   });
 
   pi.on("before_provider_request", async (event: any, ctx: any) => {
     const provider = providerFromEvent(event, ctx);
     if (!isOpenRouterProvider(provider)) return;
-    // Re-acquire every request so this process cannot keep a key stolen
-    // by another session, or a lock pruned after the owner PID died.
+    maybeHeartbeat();
     const key = ensureKey(ctx);
     if (!key) {
-      console.error("key-rotate: no OPENROUTER_API_KEY available");
+      ctx.ui?.notify?.(
+        "key-rotate: no free key — all locked or cooling (not reusing a cooled env key)",
+        "error",
+      );
       return;
     }
     applyKey(key);
@@ -335,38 +473,68 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("after_provider_response", async (event: any, ctx: any) => {
     const provider = providerFromEvent(event, ctx);
-    if (!isOpenRouterProvider(provider)) return;
+    if (provider && !isOpenRouterProvider(provider)) return;
 
     const status = event.status ?? event.response?.status;
-    const body = extractBody(event);
-    const headers = extractHeaders(event);
+    const body = collectErrorText(event);
     const kind = classifyError(status, body);
 
-    if (kind === "shared" || kind === "transient" || kind === "other") return;
+    if (status && status < 400) {
+      continueCount = 0;
+      pendingContinue = false;
+      return;
+    }
 
-    if (kind === "daily" || kind === "auth") {
-      const prev = activeKey ?? process.env.OPENROUTER_API_KEY ?? null;
-      const sid = sessionId ?? sessionIdFromCtx(ctx, event);
-      log429(event, kind, prev);
-      if (prev) {
-        const until = kind === "daily" ? parseResetEpoch(headers, body) : 0;
-        coolKey(prev, until);
-      }
-      const next = acquireKey(sid);
-      if (next && next !== prev) {
-        applyKey(next);
-        resetAdvisor(ctx);
-        ctx.ui?.notify?.(
-          `key-rotate: ${kind} on ${maskKey(prev ?? "?")} -> ${maskKey(next)} (this session only)`,
-          "warning",
+    rotateOnCap(ctx, event, kind);
+  });
+
+  pi.on("turn_end", async (event: any, ctx: any) => {
+    const msg = event?.message;
+    const text = messageErrorText(msg);
+    if (!text) return;
+    if (
+      msg?.stopReason &&
+      msg.stopReason !== "error" &&
+      !HTTP_429_RE.test(text) &&
+      !MAX_DELAY_RE.test(text)
+    ) {
+      return;
+    }
+    const kind = classifyError(undefined, text);
+    rotateOnCap(
+      ctx,
+      { ...event, errorMessage: text, status: HTTP_429_RE.test(text) ? 429 : undefined },
+      kind,
+    );
+  });
+
+  pi.on("agent_end", async (event: any, ctx: any) => {
+    const messages: any[] = event?.messages ?? [];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const text = messageErrorText(messages[i]);
+      if (!text) continue;
+      const kind = classifyError(undefined, text);
+      if (kind === "daily" || kind === "auth") {
+        rotateOnCap(
+          ctx,
+          { ...event, errorMessage: text, status: HTTP_429_RE.test(text) ? 429 : undefined },
+          kind,
         );
-      } else if (kind === "daily" && !next) {
-        ctx.ui?.notify?.(
-          `key-rotate: all keys daily-capped or locked — try /key-status or wait for UTC reset`,
-          "error",
-        );
+        return;
       }
     }
+  });
+
+  pi.on("agent_settled", async () => {
+    await maybeAutoContinue();
+  });
+
+  pi.on("message_end", async (event: any) => {
+    const m: any = event?.message;
+    if (!m || m.role !== "user") return;
+    const text = userTextFromMessage(m);
+    if (!text || text === "continue" || text === "c") return;
+    lastUserPrompt = text;
   });
 
   function handleKeyRotate(_args: unknown, ctx: any): void {
@@ -374,10 +542,14 @@ export default function (pi: ExtensionAPI) {
     const sid = sessionId ?? sessionIdFromCtx(ctx);
     sessionId = sid;
     const next = bumpKey(sid);
-    if (next) applyKey(next);
+    if (next) {
+      applyKey(next);
+    } else {
+      dropStaleKey();
+    }
     const msg = next
       ? `This session bumped ${prev ? maskKey(prev) : "?"} -> ${maskKey(next)} (other sessions unchanged)`
-      : "No free key — all locked or cooling";
+      : "No free key — all locked or cooling (not reusing a cooled key)";
     ctx.ui.notify(msg, next ? "info" : "error");
   }
 
@@ -415,6 +587,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("key_rotate", {
+    description: "Alias for /key-rotate (this session only)",
+    handler: async (args, ctx) => handleKeyRotate(args, ctx),
+  });
+
+  pi.registerCommand("rotate", {
     description: "Alias for /key-rotate (this session only)",
     handler: async (args, ctx) => handleKeyRotate(args, ctx),
   });
@@ -462,6 +639,7 @@ export default function (pi: ExtensionAPI) {
       syncQuota(sid);
       const key = acquireKey(sid);
       if (key) applyKey(key);
+      else dropStaleKey();
       const advisorReset = resetAdvisor(ctx);
       const lines = [
         "Synced with OpenRouter (did not probe keys locked by other sessions).",
@@ -476,6 +654,4 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(lines.join("\n"), key ? "success" : "warning");
     },
   });
-
-  void maybeHeartbeat;
 }

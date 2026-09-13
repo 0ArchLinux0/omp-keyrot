@@ -36,6 +36,7 @@ These rules are **per OpenRouter account** (per key), not per model.
 Important facts:
 
 - All `:free` models **share one counter** per account (not 1000 per model).
+- `openrouter/openrouter:free` (the free **router**) uses that **same** per-account counter. It is not a second pool and not unlimited.
 - OpenRouter dashboard shows **USD usage**, not free-request count. Use `/key-probe` or 429 headers to see `X-RateLimit-Remaining`.
 - Daily reset is **UTC midnight** (`X-RateLimit-Reset` header).
 - **Shared-pool / upstream** 429s are **not** key exhaustion — rotating keys does not help.
@@ -73,7 +74,8 @@ When KEY_01 is cooling:
 | `free-models-per-day-high-balance` | Same — real daily cap for $10+ accounts |
 | `401` / invalid key | Cool key, pick next |
 | `shared pool` / upstream 429 | **Do not cool** — model/provider issue, not key |
-| Transient 429 | **Do not cool** — retry without rotating |
+| HTTP 429 with **empty body** (OMP `after_provider_response`) | **Daily** — the hook has status+headers only; `:free` 429 is a per-key cap |
+| `retry.maxDelayMs` abort + nested `Original error: 429` | **Daily** — OMP will not wait ~hours; cool + bump + auto-continue |
 
 ### 4. Advisor shares main key
 
@@ -152,7 +154,7 @@ Run inside an OMP session (after extension reload / session restart):
 |---------|-------------|
 | `/key-status` | Show pool status + active session key |
 | `/key-probe [idx\|all]` | Live quota probe via OpenRouter |
-| `/key-rotate` | Manual advance to next backup key |
+| `/key-rotate` / `/rotate` | Manual advance to next free key (this session only) |
 | `/uncool` | Clear all cooldowns, restore KEY_01, reset advisor quota |
 
 ### Advisor recovery
@@ -213,7 +215,9 @@ omp --resume <session-id>
 | `Warning: xot:` spam | Old xot extension still in session | Remove xot.ts from config; restart all OMP sessions |
 | Dashboard shows low USD but 429 | USD ≠ free-request counter | `xot-rotate probe all` |
 | Shared pool 429 | Upstream model pool exhausted | Switch model — key rotation won't help |
-| `retry.maxDelayMs` exceeded | Daily cap retry-after ~6–24h | Expected; wait for reset or rotate key |
+| `retry.maxDelayMs` exceeded | Daily cap retry-after ~6–24h | Lite cools+bumps this session then auto-continues |
+| "No free key" but the turn still runs | acquire failed, `/retry` reused cooled `OPENROUTER_API_KEY` | Fixed in 1.0.2 — stale env key is dropped |
+| 429 on `openrouter/free` after another `:free` model | Same per-account counter | Router is not a second quota pool |
 
 ### Quick diagnostic script
 
@@ -251,11 +255,12 @@ OMP request (main or advisor)
   before_provider_request → re-acquire (sticky) → inject Bearer
   after_provider_response → classify 429
         │
-        ├─ daily/auth 429 → cool key → acquire next FREE key → notify
+        ├─ daily/auth 429 (incl. empty-body + maxDelayMs abort)
+        │     → cool this key → bump THIS session → auto-continue
         ├─ /key N         → this session only; refuse if locked
         ├─ /key-rotate    → bump THIS session; others unchanged
         ├─ shared pool   → ignore (no cool)
-        └─ transient     → ignore (no cool)
+        └─ no free key   → do **not** reuse a cooled env key
         │
         ▼
  xot-rotate (bash) + xot-lock.py
@@ -295,23 +300,5 @@ Session exits    → lock released
 /key 6           → THIS session only; **refuses** if another session holds KEY_06
 /key 6 steal     → explicit override (drops the other session's lock)
 /key-rotate      → bump THIS session to next free key; others unchanged
-```
 
-Locks last as long as the **OMP PID is alive**. Idle sessions keep their key (no 5-minute expiry). Dead PIDs are pruned immediately.
-
-`/key N` and `/key-rotate` in session B **do not change** session A's key, env, or lock.
-
-If B requests a key A holds: B gets an error (`KEY_N is locked by session …`) and A keeps the key. Optional `/key N steal` is the only way to evict A.
-
-```bash
-xot-rotate acquire <session-id> [pid]
-xot-rotate bump <session-id> [pid]
-xot-rotate set <N> <session-id> [pid]        # refuse if locked
-xot-rotate set <N> <session-id> [pid] --steal
-xot-rotate release <session-id>
-xot-rotate locks
-```
-
-**`/uncool` does not refill OpenRouter quota.** It probes **unlocked** keys only (skips other sessions' locks), cools exhausted keys, and re-acquires a working key for this session.
-
-**`Add 10 credits`** is the <$10-tier (50/day) message — usually a **backup key**, not KEY_01 (`high-balance` / 1000/day).
+[Showing lines 1-300 of 303. Use :301 to continue]

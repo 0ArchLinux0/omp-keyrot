@@ -17,7 +17,7 @@ This module is the 2026-09-13 incident fix: KEY_01 was actually 0/1000, `/uncool
 | Branch | https://github.com/0ArchLinux0/omp-keyrot/tree/xot-lite-session-locks |
 | Issue | https://github.com/0ArchLinux0/omp-keyrot/issues/1 |
 | PR | https://github.com/0ArchLinux0/omp-keyrot/pull/2 |
-| Release | https://github.com/0ArchLinux0/omp-keyrot/releases/tag/xot-lite-1.0.1-20260914 |
+| Release | https://github.com/0ArchLinux0/omp-keyrot/releases/tag/xot-lite-1.0.2-20260914 |
 | Notion incident | https://www.notion.so/3da7b981c5148105815cec39ddc802bf |
 | Notion usage | https://www.notion.so/3da7b981c51481e4bc95f0e60bb5e39d |
 
@@ -32,6 +32,8 @@ xot-lite/
   docs/USAGE.md
   docs/INCIDENT-2026-09-13.md
   tests/test_xot_lite.sh      # isolated, no live API
+  tests/test_xot_lock.py
+  tests/test_classify.py      # 429 empty-body + maxDelayMs → daily
   install.sh
   VERSION
 ```
@@ -69,6 +71,7 @@ modelRoles:
 ```bash
 ./xot-lite/tests/test_xot_lite.sh
 python3 -m unittest xot-lite/tests/test_xot_lock.py
+python3 -m unittest xot-lite/tests/test_classify.py
 ```
 
 No live OpenRouter calls (does not burn quota).
@@ -86,12 +89,12 @@ tar -czf "$OUT" \
 sha256sum "$OUT"
 ```
 
-Current snapshot (no secrets): `~/.local/share/snapshots/xot-lite-1.0.1-20260914.tar.gz`
+Current snapshot (no secrets): `~/.local/share/snapshots/xot-lite-1.0.2-20260914.tar.gz`
 
 Restore on another machine:
 
 ```bash
-tar -xzf xot-lite-1.0.1-20260914.tar.gz
+tar -xzf xot-lite-1.0.2-20260914.tar.gz
 cd xot-lite && ./install.sh
 # put keys at ~/.local/daemon/xot/keys (never in the tarball)
 # then restart OMP
