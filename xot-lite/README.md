@@ -18,8 +18,13 @@ This module is the 2026-09-13 incident fix: KEY_01 was actually 0/1000, `/uncool
 | Issue | https://github.com/0ArchLinux0/omp-keyrot/issues/1 |
 | PR | https://github.com/0ArchLinux0/omp-keyrot/pull/2 |
 | Release | https://github.com/0ArchLinux0/omp-keyrot/releases/tag/xot-lite-1.0.2-20260914 |
-| Notion incident | https://www.notion.so/3da7b981c5148105815cec39ddc802bf |
-| Notion usage | https://www.notion.so/3da7b981c51481e4bc95f0e60bb5e39d |
+| Notion 1.0.2 overview | https://www.notion.so/3da7b981c51481948b04c327c389d10b |
+| Notion 1.0.2 usage | https://www.notion.so/3da7b981c51481f5957bed6fcdbd2e39 |
+| Notion 1.0.2 restore | https://www.notion.so/3da7b981c5148121a867d20c3ab38de3 |
+| Notion 1.0.2 incident | https://www.notion.so/3da7b981c51481438148c9b2066a7b3c |
+| Notion 1.0.2 roadmap | https://www.notion.so/3da7b981c5148191ae46d248e9ea8746 |
+| Notion (older) incident | https://www.notion.so/3da7b981c5148105815cec39ddc802bf |
+| Notion (older) usage | https://www.notion.so/3da7b981c51481e4bc95f0e60bb5e39d |
 
 ## Layout
 
