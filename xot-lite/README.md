@@ -65,8 +65,25 @@ No live OpenRouter calls (does not burn quota).
 ## Snapshot
 
 ```bash
-tar -czf xot-lite-$(cat xot-lite/VERSION).tar.gz \
-  --exclude keys --exclude state xot-lite
+VER=$(cat xot-lite/VERSION)
+OUT="${HOME}/.local/share/snapshots/xot-lite-${VER}.tar.gz"
+mkdir -p "$(dirname "$OUT")"
+tar -czf "$OUT" \
+  --exclude keys --exclude state --exclude locks \
+  --exclude __pycache__ --exclude '*.pyc' \
+  -C "$(dirname xot-lite)" xot-lite
+sha256sum "$OUT"
+```
+
+Current snapshot (no secrets): `~/.local/share/snapshots/xot-lite-1.0.0-20260914.tar.gz`
+
+Restore on another machine:
+
+```bash
+tar -xzf xot-lite-1.0.0-20260914.tar.gz
+cd xot-lite && ./install.sh
+# put keys at ~/.local/daemon/xot/keys (never in the tarball)
+# then restart OMP
 ```
 
 ## Runtime state (machine-local, not in git)
