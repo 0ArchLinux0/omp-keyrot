@@ -300,5 +300,75 @@ Session exits    → lock released
 /key 6           → THIS session only; **refuses** if another session holds KEY_06
 /key 6 steal     → explicit override (drops the other session's lock)
 /key-rotate      → bump THIS session to next free key; others unchanged
+```
 
-[Showing lines 1-300 of 303. Use :301 to continue]
+
+## Session commands (`/key N`)
+
+| Command | Scope | Effect |
+|---------|-------|--------|
+| `/key N` | This session | Bind KEY_N if free. **Refuses** if another live session holds it. |
+| `/key N steal` | This session | Take KEY_N even if locked (drops the other session's lock). |
+| `/key-rotate` / `/rotate` / `/key_rotate` | This session | Bump to the next free key. Other sessions unchanged. |
+| `/key-status` | Read | Pool + this session's mask + lock id |
+| `/key-probe [idx\|all]` | Live HTTP | Burns quota — do not spam `all` |
+| `/uncool` | This session | `sync_quota` (skips keys locked by others) then re-acquire |
+
+CLI equivalents (used by the extension):
+
+```bash
+xot-rotate acquire <session-id> <pid>
+xot-rotate bump <session-id> <pid>
+xot-rotate set <N> <session-id> <pid> [--steal]
+xot-rotate release <session-id>
+xot-rotate heartbeat <session-id> <pid>
+xot-rotate sync_quota <session-id> <pid>
+xot-rotate locks
+```
+
+---
+
+## Caveats (read before debugging a 429)
+
+1. **Restart OMP after every extension install.** `key-rotate-lite.ts` is loaded at `session_start`. A long-lived `omp --resume` still runs the old handler even if the file on disk is 1.0.2.
+2. **`:free` is one counter per account, all models.** `ling-3.0-flash-vl:free`, `laguna-*`, and `openrouter/openrouter:free` share it. The free **router is not a second pool** and is not unlimited.
+3. **Dashboard USD ≠ free-request count.** `/api/v1/auth/key` shows spend. Remaining `:free` quota appears only in 429 headers (`X-RateLimit-Remaining` / `X-RateLimit-Reset`) or `/key-probe`.
+4. **`Add 10 credits` is the backup-key tier**, not "KEY_01 needs payment." KEY_01's exhausted message is `free-models-per-day-high-balance`.
+5. **`/uncool` does not refill OpenRouter.** It clears local `COOL_*` and re-probes. Quota comes back at **UTC midnight**.
+6. **Two sessions = two keys.** If both are cooling and the rest are capped, you will see `No free key`. Wait for UTC reset or `/key N steal` a locked key (the other session will keep sending the stolen key until it restarts).
+7. **Do not `probe all` while sessions are live.** 15 probes burn 15 `:free` requests and can 429 backups that were still OK.
+8. **OMP `retry.maxDelayMs` is 300000 ms.** Daily-cap `retry-after-ms` is hours. 1.0.2 classifies that abort as daily and rotates; old sessions abort and sit.
+9. **Empty-body 429 is daily.** `after_provider_response` has status+headers only. Shared-pool is the only 429 that must **not** cool a key (body must contain `shared pool` / `provider exhausted`).
+10. **Never reuse a cooled env key.** If acquire fails, 1.0.2 drops `OPENROUTER_API_KEY`. `/retry` on 1.0.1 still sent the dead key — that is "No free key showing but runs."
+11. **Do not re-enable `xot.ts` / `auto-rotate.ts` / `openrouter-paid`.** Lite replaces them. Running both double-rotates and reprints `Warning: xot:`.
+12. **Keys are never in git or the tarball.** Restore always needs `~/.local/daemon/xot/keys` from this machine (or a private backup you keep yourself).
+13. **Advisor pause is separate.** After rotating, `/uncool` flips advisor off/on. If the banner stays, `/advisor off` then `/advisor on` in a **restarted** session.
+
+---
+
+## Version map
+
+| Version | What it fixed |
+|---------|----------------|
+| 1.0.0 | Portable module; disable legacy XOT; primary-first |
+| 1.0.1 | Session locks; `/key N` refuse; no idle prune; `sync_quota` skips locked keys |
+| **1.0.2** | Empty-body 429 + `retry.maxDelayMs` → daily; auto-continue; no cooled-env fallback; `/rotate` alias |
+
+Current: `xot-lite/VERSION` → `1.0.2-20260914`.
+
+---
+
+## Restore / local snapshot
+
+See **[RESTORE.md](./RESTORE.md)**. Snapshot (no secrets):
+
+`~/.local/share/snapshots/xot-lite-1.0.2-20260914.tar.gz`
+
+---
+
+## Related
+
+- Incident: [INCIDENT-2026-09-13.md](./INCIDENT-2026-09-13.md)
+- Changelog: [CHANGELOG.md](./CHANGELOG.md)
+- Improvements: [ROADMAP.md](./ROADMAP.md)
+- GitHub release: https://github.com/0ArchLinux0/omp-keyrot/releases/tag/xot-lite-1.0.2-20260914
