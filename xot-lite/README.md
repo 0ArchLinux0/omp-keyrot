@@ -31,9 +31,14 @@ xot-lite/
   extensions/advisor-manager.ts
   docs/USAGE.md
   docs/INCIDENT-2026-09-13.md
+  docs/RESTORE.md             # how to bring this machine back
+  docs/CHANGELOG.md
+  docs/ROADMAP.md             # caveats + next improvements
   tests/test_xot_lite.sh      # isolated, no live API
   tests/test_xot_lock.py
   tests/test_classify.py      # 429 empty-body + maxDelayMs → daily
+  scripts/snapshot.sh
+  scripts/restore.sh
   install.sh
   VERSION
 ```
@@ -54,6 +59,7 @@ xot-lite/
 | `bin/xot-rotate` | `~/.local/bin/xot-rotate` |
 | `lib/xot-lock.py` | `~/.local/daemon/xot/xot-lock.py` |
 | `extensions/*.ts` | `~/.omp/agent/extensions/` |
+| `docs/*.md` | `~/.local/share/docs/` |
 
 It does **not** overwrite `keys` or `config.yml`. Wire extensions in `~/.omp/agent/config.yml`:
 
@@ -91,6 +97,11 @@ sha256sum "$OUT"
 
 Current snapshot (no secrets): `~/.local/share/snapshots/xot-lite-1.0.2-20260914.tar.gz`
 
+```bash
+./xot-lite/scripts/snapshot.sh          # refresh tarball + ~/.local/share/docs
+./xot-lite/scripts/restore.sh           # install from that tarball
+```
+
 Restore on another machine:
 
 ```bash
@@ -99,6 +110,8 @@ cd xot-lite && ./install.sh
 # put keys at ~/.local/daemon/xot/keys (never in the tarball)
 # then restart OMP
 ```
+
+Full procedure: [docs/RESTORE.md](docs/RESTORE.md). Caveats + backlog: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Runtime state (machine-local, not in git)
 
