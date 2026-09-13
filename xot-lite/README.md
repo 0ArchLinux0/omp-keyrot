@@ -4,8 +4,8 @@ Portable OpenRouter **`:free` key rotator** for OMP/pi-coding-agent.
 
 - **15 independent accounts** (not one shared balance)
 - **KEY_01 first** ($10+ credits → 1000 `:free`/day); backups ~50/day
-- **One key per OMP session** (`flock` + JSON registry)
-- **Manual override** `/key N`
+- **One key per OMP session** (`flock` + JSON registry); `/key N` and `/key-rotate` do not move other sessions
+- **`/key N` refuses** if that key is locked (optional `/key N steal`)
 - **No paid provider**, no legacy `xot.ts` stack
 
 This module is the 2026-09-13 incident fix: KEY_01 was actually 0/1000, `/uncool` did not refill quota, and concurrent sessions burned the same key.
@@ -75,12 +75,12 @@ tar -czf "$OUT" \
 sha256sum "$OUT"
 ```
 
-Current snapshot (no secrets): `~/.local/share/snapshots/xot-lite-1.0.0-20260914.tar.gz`
+Current snapshot (no secrets): `~/.local/share/snapshots/xot-lite-1.0.1-20260914.tar.gz`
 
 Restore on another machine:
 
 ```bash
-tar -xzf xot-lite-1.0.0-20260914.tar.gz
+tar -xzf xot-lite-1.0.1-20260914.tar.gz
 cd xot-lite && ./install.sh
 # put keys at ~/.local/daemon/xot/keys (never in the tarball)
 # then restart OMP

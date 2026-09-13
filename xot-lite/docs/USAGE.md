@@ -1,6 +1,6 @@
 # XOT Key Rotation — Usage & Reference
 
-**Last updated:** 2026-09-13  
+**Last updated:** 2026-09-14  
 **Stack:** `xot-rotate` (bash) + `key-rotate-lite.ts` (OMP extension)  
 **Policy:** primary-first, sticky backup, reset-based cooldown  
 **Models:** `:free` only — no paid provider
@@ -247,19 +247,22 @@ OMP request (main or advisor)
         │
         ▼
  key-rotate-lite.ts
-   session_start → xot-rotate pick → KEY_01
-   before_provider_request → inject Bearer token
-   after_provider_response → classify 429
+  session_start → xot-rotate acquire (session lock)
+  before_provider_request → re-acquire (sticky) → inject Bearer
+  after_provider_response → classify 429
         │
-        ├─ daily/auth 429 → cool key → pick next → notify
+        ├─ daily/auth 429 → cool key → acquire next FREE key → notify
+        ├─ /key N         → this session only; refuse if locked
+        ├─ /key-rotate    → bump THIS session; others unchanged
         ├─ shared pool   → ignore (no cool)
         └─ transient     → ignore (no cool)
         │
         ▼
- xot-rotate (bash)
-   pick: primary-first, sticky backup
+ xot-rotate (bash) + xot-lock.py
+   acquire/bump/set: per-session locks (flock + registry)
+   pick: fallback only (skips cooling + locked; never steals)
    state: ~/.local/daemon/xot/state
-   keys:  ~/.local/daemon/xot/keys (15 lines)
+   locks: ~/.local/daemon/xot/locks/registry.json
         │
         ▼
  OpenRouter API (openrouter.ai/api/v1)
@@ -289,19 +292,26 @@ Session A starts → KEY_01 if free
 Session B starts → next free key (not A's)
 Session C starts → next free
 Session exits    → lock released
-/key 6           → steal KEY_06 for this session
-/key-rotate      → bump to next free key (session lock kept)
+/key 6           → THIS session only; **refuses** if another session holds KEY_06
+/key 6 steal     → explicit override (drops the other session's lock)
+/key-rotate      → bump THIS session to next free key; others unchanged
 ```
 
-Stale locks (dead PID or 5 min without heartbeat) are pruned.
+Locks last as long as the **OMP PID is alive**. Idle sessions keep their key (no 5-minute expiry). Dead PIDs are pruned immediately.
+
+`/key N` and `/key-rotate` in session B **do not change** session A's key, env, or lock.
+
+If B requests a key A holds: B gets an error (`KEY_N is locked by session …`) and A keeps the key. Optional `/key N steal` is the only way to evict A.
 
 ```bash
 xot-rotate acquire <session-id> [pid]
 xot-rotate bump <session-id> [pid]
+xot-rotate set <N> <session-id> [pid]        # refuse if locked
+xot-rotate set <N> <session-id> [pid] --steal
 xot-rotate release <session-id>
 xot-rotate locks
 ```
 
-**`/uncool` does not refill OpenRouter quota.** It probes live remaining counts, cools exhausted keys, and re-acquires a working key for this session.
+**`/uncool` does not refill OpenRouter quota.** It probes **unlocked** keys only (skips other sessions' locks), cools exhausted keys, and re-acquires a working key for this session.
 
 **`Add 10 credits`** is the <$10-tier (50/day) message — usually a **backup key**, not KEY_01 (`high-balance` / 1000/day).

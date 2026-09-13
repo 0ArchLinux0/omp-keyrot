@@ -2,7 +2,8 @@
  * key-rotate-lite — OpenRouter key rotation via xot-rotate (no full XOT stack).
  *
  * Multi-session: each OMP session auto-acquires an exclusive key via flock+registry.
- * Manual override: /key N still works (steals lock for this session).
+ * /key N and /key-rotate affect THIS session only. /key N refuses if another
+ * live session holds that key (/key N steal to override).
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -32,6 +33,15 @@ function maskKey(key: string): string {
 
 function runXot(args: string[]): string {
   return execFileSync(XOT_ROTATE, args, { encoding: "utf8", timeout: 30_000 });
+}
+
+function xotError(e: unknown): string {
+  const err = e as { stderr?: Buffer | string; message?: string };
+  const raw = err?.stderr;
+  const s = Buffer.isBuffer(raw)
+    ? raw.toString("utf8")
+    : String(raw ?? err?.message ?? e);
+  return s.trim();
 }
 
 function parseExportKey(out: string): string | null {
@@ -101,15 +111,21 @@ function bumpKey(sessionId: string): string | null {
   }
 }
 
-function setKeyByNumber(oneBased: number, sessionId?: string): string | null {
-  if (!existsSync(XOT_ROTATE)) return null;
+function setKeyByNumber(
+  oneBased: number,
+  sessionId?: string,
+  steal = false,
+): { key: string | null; error?: string } {
+  if (!existsSync(XOT_ROTATE)) return { key: null, error: "xot-rotate not found" };
   try {
-    const args = sessionId
-      ? ["set", String(oneBased), sessionId, String(process.pid)]
-      : ["set", String(oneBased)];
-    return parseExportKey(runXot(args));
-  } catch {
-    return null;
+    const args = ["set", String(oneBased)];
+    if (sessionId) {
+      args.push(sessionId, String(process.pid));
+    }
+    if (steal) args.push("--steal");
+    return { key: parseExportKey(runXot(args)) };
+  } catch (e) {
+    return { key: null, error: xotError(e) };
   }
 }
 
@@ -124,10 +140,13 @@ function coolKey(key: string, untilEpoch = 0): void {
   }
 }
 
-function syncQuota(): string | null {
+function syncQuota(sessionId?: string): string | null {
   if (!existsSync(XOT_ROTATE)) return process.env.OPENROUTER_API_KEY?.trim() || null;
   try {
-    return parseExportKey(runXot(["sync_quota"]));
+    const args = sessionId
+      ? ["sync_quota", sessionId, String(process.pid)]
+      : ["sync_quota"];
+    return parseExportKey(runXot(args));
   } catch {
     return null;
   }
@@ -258,6 +277,7 @@ export default function (pi: ExtensionAPI) {
     sessionId = sid;
     const key = acquireKey(sid);
     if (key) applyKey(key);
+    lastHeartbeat = Date.now();
     return key;
   }
 
@@ -287,8 +307,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_provider_request", async (event: any, ctx: any) => {
     const provider = providerFromEvent(event, ctx);
     if (!isOpenRouterProvider(provider)) return;
-    maybeHeartbeat();
-    const key = activeKey ?? ensureKey(ctx);
+    // Re-acquire every request so this process cannot keep a key stolen
+    // by another session, or a lock pruned after the owner PID died.
+    const key = ensureKey(ctx);
     if (!key) {
       console.error("key-rotate: no OPENROUTER_API_KEY available");
       return;
@@ -305,8 +326,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_provider_headers", async (event: any, ctx: any) => {
     const provider = providerFromEvent(event, ctx);
     if (!isOpenRouterProvider(provider)) return;
-    maybeHeartbeat();
-    const key = activeKey ?? ensureKey(ctx);
+    const key = ensureKey(ctx);
     if (!key) return;
     event.headers = event.headers ?? {};
     event.headers.Authorization = `Bearer ${key}`;
@@ -337,54 +357,66 @@ export default function (pi: ExtensionAPI) {
         applyKey(next);
         resetAdvisor(ctx);
         ctx.ui?.notify?.(
-          `key-rotate: ${kind} on ${maskKey(prev ?? "?")} -> ${maskKey(next)} (session lock)`,
+          `key-rotate: ${kind} on ${maskKey(prev ?? "?")} -> ${maskKey(next)} (this session only)`,
           "warning",
         );
       } else if (kind === "daily" && !next) {
         ctx.ui?.notify?.(
-          `key-rotate: all keys daily-capped or locked — try /key-probe all or wait for UTC reset`,
+          `key-rotate: all keys daily-capped or locked — try /key-status or wait for UTC reset`,
           "error",
         );
       }
     }
   });
 
+  function handleKeyRotate(_args: unknown, ctx: any): void {
+    const prev = activeKey;
+    const sid = sessionId ?? sessionIdFromCtx(ctx);
+    sessionId = sid;
+    const next = bumpKey(sid);
+    if (next) applyKey(next);
+    const msg = next
+      ? `This session bumped ${prev ? maskKey(prev) : "?"} -> ${maskKey(next)} (other sessions unchanged)`
+      : "No free key — all locked or cooling";
+    ctx.ui.notify(msg, next ? "info" : "error");
+  }
+
   pi.registerCommand("key", {
-    description: "Force KEY_N (e.g. /key 2 -> KEY_02)",
+    description:
+      "Force KEY_N for THIS session only (e.g. /key 2). Refuses if another session holds it; /key 2 steal to override.",
     handler: async (args, ctx) => {
       const raw = args.trim();
       const n = Number.parseInt(raw, 10);
       if (!raw || !Number.isFinite(n) || n < 1) {
-        ctx.ui.notify("Usage: /key <N>  (1=KEY_01, 2=KEY_02, ...)", "warning");
+        ctx.ui.notify("Usage: /key <N>  (1=KEY_01). /key N steal to take a locked key.", "warning");
         return;
       }
       const sid = sessionId ?? sessionIdFromCtx(ctx);
       sessionId = sid;
-      const key = setKeyByNumber(n, sid);
+      const steal = /\bsteal\b/i.test(raw);
+      const { key, error } = setKeyByNumber(n, sid, steal);
       if (key) applyKey(key);
       const label = `KEY_${String(n).padStart(2, "0")}`;
-      ctx.ui.notify(
-        key
-          ? `Forced ${label}: ${maskKey(key)} (session lock)`
-          : `Failed to set ${label} — out of range or missing keys file`,
-        key ? "success" : "error",
-      );
+      let msg: string;
+      if (key) {
+        msg = `This session -> ${label}: ${maskKey(key)} (other sessions unchanged)`;
+      } else if (error && /locked by session/i.test(error)) {
+        msg = `${label} is in use by another session — not taken.\n${error}\nUse a free key (/key-status) or /key ${n} steal to override.`;
+      } else {
+        msg = `Failed to set ${label}${error ? `: ${error}` : ""}`;
+      }
+      ctx.ui.notify(msg, key ? "success" : "error");
     },
   });
 
   pi.registerCommand("key-rotate", {
-    description: "Move this session to the next free key (keeps lock)",
-    handler: async (_args, ctx) => {
-      const prev = activeKey;
-      const sid = sessionId ?? sessionIdFromCtx(ctx);
-      sessionId = sid;
-      const next = bumpKey(sid);
-      if (next) applyKey(next);
-      const msg = next
-        ? `Bumped ${prev ? maskKey(prev) : "?"} -> ${maskKey(next)} (session lock)`
-        : "No free key — all locked or cooling";
-      ctx.ui.notify(msg, next ? "info" : "error");
-    },
+    description: "Move THIS session to the next free key (other sessions unchanged)",
+    handler: async (args, ctx) => handleKeyRotate(args, ctx),
+  });
+
+  pi.registerCommand("key_rotate", {
+    description: "Alias for /key-rotate (this session only)",
+    handler: async (args, ctx) => handleKeyRotate(args, ctx),
   });
 
   pi.registerCommand("key-status", {
@@ -423,21 +455,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("uncool", {
-    description: "Sync quota, re-acquire session key, reset advisor",
+    description: "Sync quota for unlocked keys, re-acquire THIS session's key, reset advisor",
     handler: async (_args, ctx) => {
-      syncQuota();
       const sid = sessionId ?? sessionIdFromCtx(ctx);
       sessionId = sid;
+      syncQuota(sid);
       const key = acquireKey(sid);
       if (key) applyKey(key);
       const advisorReset = resetAdvisor(ctx);
       const lines = [
-        "Synced with OpenRouter (local COOL cleared).",
+        "Synced with OpenRouter (did not probe keys locked by other sessions).",
         key
-          ? `Active: ${maskKey(key)} (auto-assigned for this session)`
+          ? `This session: ${maskKey(key)}`
           : "No working key - all daily-capped until UTC midnight",
-        "Multi-session: each OMP session gets its own key automatically.",
-        "Manual override: /key <N>",
+        "Other sessions keep their locks. Manual: /key <N>  (refuses if locked)",
         advisorReset
           ? "Advisor quota state reset."
           : "Run /advisor off then /advisor on if quota warning persists.",
@@ -445,4 +476,6 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(lines.join("\n"), key ? "success" : "warning");
     },
   });
+
+  void maybeHeartbeat;
 }

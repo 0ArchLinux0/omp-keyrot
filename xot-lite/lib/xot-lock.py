@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""XOT session key locks — one OpenRouter key per OMP session (auto-assign)."""
+"""XOT session key locks — one OpenRouter key per OMP session (auto-assign).
+
+Isolation rules:
+- acquire/bump never take a key held by another live PID.
+- force (/key N) refuses if another live session holds the key unless --steal.
+- Locks live as long as the owning PID is alive (idle sessions keep their key).
+"""
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +20,9 @@ REGISTRY = Path(os.environ.get("XOT_LOCK_REGISTRY", XOT_HOME / "locks/registry.j
 KEY_FILE = Path(os.environ.get("XOT_KEY_FILE", XOT_HOME / "keys"))
 STATE_FILE = Path(os.environ.get("XOT_STATE_FILE", XOT_HOME / "state"))
 PRIMARY_IDX = int(os.environ.get("PRIMARY_IDX", "0"))
-STALE_SECS = int(os.environ.get("XOT_LOCK_STALE_SECS", "300"))
+# Heartbeat age is NOT used to drop live-PID locks. Idle OMP sessions must keep
+# their key. Dead PIDs are pruned immediately.
+STALE_SECS = int(os.environ.get("XOT_LOCK_STALE_SECS", "86400"))
 
 
 def _load_keys() -> list[str]:
@@ -84,13 +92,11 @@ def _label(idx: int) -> str:
 
 def prune(data: dict | None = None, persist: bool = False) -> dict:
     data = data if data is not None else _load_registry()
-    now = int(time.time())
     sessions = data.get("sessions", {})
     kept: dict = {}
     for sid, entry in sessions.items():
         pid = int(entry.get("pid", 0))
-        hb = int(entry.get("heartbeat", entry.get("acquired_at", 0)))
-        if _pid_alive(pid) and (now - hb) <= STALE_SECS:
+        if _pid_alive(pid):
             kept[sid] = entry
     data["sessions"] = kept
     if persist:
@@ -99,15 +105,13 @@ def prune(data: dict | None = None, persist: bool = False) -> dict:
 
 
 def _owner_of_idx(data: dict, idx: int, except_sid: str | None = None) -> str | None:
-    now = int(time.time())
     for sid, entry in data.get("sessions", {}).items():
         if except_sid and sid == except_sid:
             continue
         if int(entry.get("key_idx", -1)) != idx:
             continue
         pid = int(entry.get("pid", 0))
-        hb = int(entry.get("heartbeat", entry.get("acquired_at", 0)))
-        if _pid_alive(pid) and (now - hb) <= STALE_SECS:
+        if _pid_alive(pid):
             return sid
     return None
 
@@ -167,14 +171,24 @@ def bump(session_id: str, pid: int) -> int:
     return acquire(session_id, pid, skip_idx=skip)
 
 
-def force(session_id: str, key_idx: int, pid: int) -> int:
+def force(session_id: str, key_idx: int, pid: int, steal: bool = False) -> int:
+    """Assign KEY idx to session. Default: refuse if another live session holds it.
+
+    Returns:
+      >=0  assigned index
+      -1   out of range / no keys
+      -2   locked by another session (owner printed to stderr as LOCKED_BY <sid>)
+    """
     keys = _load_keys()
     if key_idx < 0 or key_idx >= len(keys):
         return -1
     data = prune()
-    for sid, entry in list(data["sessions"].items()):
-        if sid != session_id and int(entry.get("key_idx", -1)) == key_idx:
-            del data["sessions"][sid]
+    owner = _owner_of_idx(data, key_idx, except_sid=session_id)
+    if owner and not steal:
+        print(f"LOCKED_BY {owner}", file=sys.stderr)
+        return -2
+    if owner and steal:
+        del data["sessions"][owner]
     return _assign(data, session_id, key_idx, pid, forced=True)
 
 
@@ -210,6 +224,22 @@ def locked_indices() -> list[int]:
     return [i for i in out if i >= 0]
 
 
+def owner_of(idx: int) -> str | None:
+    data = prune()
+    return _owner_of_idx(data, idx)
+
+
+def get_session(session_id: str) -> int:
+    data = prune()
+    entry = data.get("sessions", {}).get(session_id)
+    if not entry:
+        return -1
+    try:
+        return int(entry.get("key_idx", -1))
+    except (TypeError, ValueError):
+        return -1
+
+
 def status_text() -> str:
     data = prune(persist=True)
     keys = _load_keys()
@@ -221,13 +251,14 @@ def status_text() -> str:
         idx = int(entry.get("key_idx", -1))
         pid = int(entry.get("pid", 0))
         hb = int(entry.get("heartbeat", 0))
-        age = now - hb
+        age = now - hb if hb else -1
         suffix = keys[idx][-4:] if 0 <= idx < len(keys) and len(keys[idx]) >= 4 else "?"
         alive = _pid_alive(pid)
+        forced = " forced" if entry.get("forced") else ""
         sid_show = sid if len(sid) <= 16 else sid[:12] + "…"
         lines.append(
             f"  {sid_show} -> {_label(idx)} ...{suffix} pid={pid} "
-            f"{'alive' if alive else 'dead'} hb={age}s ago"
+            f"{'alive' if alive else 'dead'} hb={age}s ago{forced}"
         )
     return "\n".join(lines)
 
@@ -235,43 +266,47 @@ def status_text() -> str:
 def main() -> int:
     if len(sys.argv) < 2:
         print(
-            "usage: xot-lock.py {acquire|release|force|bump|heartbeat|prune|status|locked} ...",
+            "usage: xot-lock.py {acquire|release|force|bump|heartbeat|prune|status|locked|owner|get} ...",
             file=sys.stderr,
         )
         return 1
     cmd = sys.argv[1]
+    args = [a for a in sys.argv[2:] if a != "--steal"]
+    steal = "--steal" in sys.argv
     if cmd == "acquire":
-        if len(sys.argv) < 4:
+        if len(args) < 2:
             print("usage: xot-lock.py acquire <session_id> <pid>", file=sys.stderr)
             return 1
-        idx = acquire(sys.argv[2], int(sys.argv[3]))
+        idx = acquire(args[0], int(args[1]))
         print(idx)
         return 0 if idx >= 0 else 2
     if cmd == "bump":
-        if len(sys.argv) < 4:
+        if len(args) < 2:
             print("usage: xot-lock.py bump <session_id> <pid>", file=sys.stderr)
             return 1
-        idx = bump(sys.argv[2], int(sys.argv[3]))
+        idx = bump(args[0], int(args[1]))
         print(idx)
         return 0 if idx >= 0 else 2
     if cmd == "release":
-        if len(sys.argv) < 3:
+        if len(args) < 1:
             print("usage: xot-lock.py release <session_id>", file=sys.stderr)
             return 1
-        release(sys.argv[2])
+        release(args[0])
         return 0
     if cmd == "force":
-        if len(sys.argv) < 5:
-            print("usage: xot-lock.py force <session_id> <key_idx> <pid>", file=sys.stderr)
+        if len(args) < 3:
+            print("usage: xot-lock.py force <session_id> <key_idx> <pid> [--steal]", file=sys.stderr)
             return 1
-        idx = force(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+        idx = force(args[0], int(args[1]), int(args[2]), steal=steal)
         print(idx)
+        if idx == -2:
+            return 3
         return 0 if idx >= 0 else 2
     if cmd == "heartbeat":
-        if len(sys.argv) < 4:
+        if len(args) < 2:
             print("usage: xot-lock.py heartbeat <session_id> <pid>", file=sys.stderr)
             return 1
-        ok = heartbeat(sys.argv[2], int(sys.argv[3]))
+        ok = heartbeat(args[0], int(args[1]))
         return 0 if ok else 1
     if cmd == "prune":
         prune(persist=True)
@@ -282,6 +317,22 @@ def main() -> int:
     if cmd == "locked":
         print(" ".join(str(i) for i in locked_indices()))
         return 0
+    if cmd == "owner":
+        if len(args) < 1:
+            print("usage: xot-lock.py owner <key_idx>", file=sys.stderr)
+            return 1
+        owner = owner_of(int(args[0]))
+        if owner:
+            print(owner)
+            return 0
+        return 1
+    if cmd == "get":
+        if len(args) < 1:
+            print("usage: xot-lock.py get <session_id>", file=sys.stderr)
+            return 1
+        idx = get_session(args[0])
+        print(idx)
+        return 0 if idx >= 0 else 1
     print(f"unknown command: {cmd}", file=sys.stderr)
     return 1
 
