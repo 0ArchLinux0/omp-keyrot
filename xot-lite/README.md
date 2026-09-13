@@ -10,6 +10,17 @@ Portable OpenRouter **`:free` key rotator** for OMP/pi-coding-agent.
 
 This module is the 2026-09-13 incident fix: KEY_01 was actually 0/1000, `/uncool` did not refill quota, and concurrent sessions burned the same key.
 
+## GitHub
+
+| | |
+|---|---|
+| Branch | https://github.com/0ArchLinux0/omp-keyrot/tree/xot-lite-session-locks |
+| Issue | https://github.com/0ArchLinux0/omp-keyrot/issues/1 |
+| PR | https://github.com/0ArchLinux0/omp-keyrot/pull/2 |
+| Release | https://github.com/0ArchLinux0/omp-keyrot/releases/tag/xot-lite-1.0.1-20260914 |
+| Notion incident | https://www.notion.so/3da7b981c5148105815cec39ddc802bf |
+| Notion usage | https://www.notion.so/3da7b981c51481e4bc95f0e60bb5e39d |
+
 ## Layout
 
 ```
