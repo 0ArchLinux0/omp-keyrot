@@ -1,0 +1,616 @@
+#!/usr/bin/env bash
+# xot-rotate — OpenRouter key rotator (primary-first, sticky backup).
+#
+# POLICY (2026-09-13):
+#   - 15 keys = 15 independent OpenRouter accounts (not shared balance).
+#   - KEY_01 (index 0): $10+ credits tier → 1000 :free req/day.
+#   - KEY_02..15: < $10 tier → ~50 :free req/day each.
+#   - :free limits are per-account, all :free models share the daily counter.
+#   - Stay on KEY_01 until real daily-cap 429 (incl. high-balance variant).
+#   - Do NOT cool on shared-pool / upstream / transient errors.
+#   - Cool until X-RateLimit-Reset (UTC midnight) when available.
+#   - When primary is cooling: stick to current backup if still OK.
+#   - Advisor + main agent share the same key (via key-rotate-lite).
+#
+# State: ~/.local/daemon/xot/state
+#   ACTIVE_IDX=N
+#   ROTATED_AT=<epoch>
+#   COOL_<fingerprint>=<epoch_until>
+#
+# Commands:
+#   acquire <sid> [pid] — auto-assign + lock key for this OMP session
+#   release <sid>       — release session lock on exit
+#   bump <sid> [pid]    — move this session to the next free key (/key-rotate)
+#   locks               — show session→key assignments
+#   pick                — single-session pick (skips cooling + locked keys)
+#   set <N> [sid] [pid] — force KEY_N for this session; refuses if another session holds it
+#   set --steal <N> [sid] [pid] — explicit steal (drops the other session's lock)
+#   rotate              — next backup, skipping cooling + locked
+#   cool <idx|fp> [until] — mark key cooling (idx is 0-based or KEY_N 1-based)
+#   uncool <idx|fp>     — clear one cooldown
+#   uncool_all          — clear all COOL_* (does NOT refill OpenRouter quota)
+#   sync_quota          — probe OpenRouter, cool exhausted, pick first working
+#   status | probe [idx|all] | classify <text>
+
+set -euo pipefail
+
+XOT_HOME="${XOT_HOME:-$HOME/.local/daemon/xot}"
+KEY_FILE="${XOT_KEY_FILE:-$XOT_HOME/keys}"
+STATE_FILE="${XOT_STATE_FILE:-$XOT_HOME/state}"
+COOL_SECS=${COOL_SECS:-28800}
+PRIMARY_IDX=${PRIMARY_IDX:-0}
+PROBE_MODEL="${XOT_PROBE_MODEL:-inclusionai/ling-3.0-flash-vl:free}"
+
+LOCK_DIR="${XOT_HOME}/locks"
+XOT_LOCK_PY="${XOT_LOCK_PY:-$XOT_HOME/xot-lock.py}"
+LOCK_STALE_SECS=${XOT_LOCK_STALE_SECS:-86400}
+
+lock_init() {
+  mkdir -p "$LOCK_DIR"
+  [ -f "$XOT_LOCK_PY" ] || { echo "xot-rotate: missing $XOT_LOCK_PY" >&2; return 1; }
+}
+
+with_flock() {
+  lock_init || return 1
+  (
+    flock -w 15 9 || { echo "xot-rotate: flock timeout" >&2; exit 1; }
+    "$@"
+  ) 9>"$LOCK_DIR/.flock"
+}
+midnight_utc_epoch() {
+  date -u -d "tomorrow 00:00:00" +%s 2>/dev/null || \
+    python3 -c "from datetime import datetime, timezone, timedelta; n=datetime.now(timezone.utc); t=(n+timedelta(days=1)).date(); print(int(datetime(t.year,t.month,t.day,tzinfo=timezone.utc).timestamp()))"
+}
+
+normalize_until() {
+  local v="${1:-0}"
+  [ -z "$v" ] || [ "$v" = "0" ] && return 1
+  if [ "$v" -gt 10000000000 ] 2>/dev/null; then
+    echo $(( v / 1000 ))
+  else
+    echo "$v"
+  fi
+}
+
+key_fp() {
+  echo -n "$1" | sha256sum | awk '{print $1}' | cut -c1-16
+}
+
+load_keys() {
+  mapfile -t KEYS < <(grep -vE '^#|^[[:space:]]*$' "$KEY_FILE")
+  N=${#KEYS[@]}
+}
+
+key_label() {
+  printf "KEY_%02d" "$(( $1 + 1 ))"
+}
+
+key_suffix() {
+  local k=$1
+  [ ${#k} -ge 4 ] && echo "...${k: -4}" || echo "?"
+}
+
+tier_label() {
+  [ "$1" -eq "$PRIMARY_IDX" ] && echo "1000/day" || echo "~50/day"
+}
+
+state_load() {
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    source <(grep -E '^(ACTIVE_IDX|ROTATED_AT|COOL_)=' "$STATE_FILE" 2>/dev/null)
+  fi
+  ACTIVE_IDX=${ACTIVE_IDX:-$PRIMARY_IDX}
+  ACTIVE_IDX=$(( 10#$ACTIVE_IDX ))
+}
+
+state_tmp() {
+  echo "${STATE_FILE}.tmp.$$"
+}
+
+state_save() {
+  local idx=$1 now tmp
+  now=$(date +%s)
+  tmp=$(state_tmp)
+  {
+    echo "ACTIVE_IDX=$idx"
+    echo "ROTATED_AT=$now"
+    if [ -f "$STATE_FILE" ]; then
+      grep -E '^COOL_' "$STATE_FILE" 2>/dev/null | while IFS= read -r line || [ -n "$line" ]; do
+        val="${line#*=}"
+        if [ "$val" -gt "$now" ] 2>/dev/null; then
+          echo "$line"
+        fi
+      done || true
+    fi
+  } > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+is_locked_idx() {
+  local idx=$1 locked
+  [ -f "$XOT_LOCK_PY" ] || return 1
+  locked=$(python3 "$XOT_LOCK_PY" locked 2>/dev/null || true)
+  [[ " $locked " == *" $idx "* ]]
+}
+
+is_cooling_idx() {
+  local idx=$1 now=$2
+  local fp cool_ts
+  fp=$(key_fp "${KEYS[$idx]}")
+  cool_ts=$(grep "^COOL_${fp}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2)
+  [ -n "$cool_ts" ] && [ "$cool_ts" -gt "$now" ] 2>/dev/null
+}
+
+state_cool() {
+  local fp=$1 until now tmp
+  now=$(date +%s)
+  until=$(normalize_until "${2:-0}" 2>/dev/null) || until=$(( now + COOL_SECS ))
+  if [ "$until" -le "$now" ] 2>/dev/null; then
+    until=$(midnight_utc_epoch)
+  fi
+  tmp=$(state_tmp)
+  if [ -f "$STATE_FILE" ]; then
+    grep -v "^COOL_${fp}=" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  fi
+  echo "COOL_${fp}=${until}" >> "$STATE_FILE"
+  echo "xot-rotate: cooled $fp until $(date -u -d "@$until" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo "$until")" >&2
+}
+
+state_uncool() {
+  local fp=$1 tmp
+  [ -f "$STATE_FILE" ] || return 0
+  tmp=$(state_tmp)
+  grep -v "^COOL_${fp}=" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+resolve_fp() {
+  local arg=$1
+  load_keys
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    key_fp "${KEYS[$arg]}"
+  else
+    echo "$arg"
+  fi
+}
+
+key_available() {
+  local idx=$1 now=$2
+  ! is_cooling_idx "$idx" "$now" && ! is_locked_idx "$idx"
+}
+
+find_next_backup() {
+  local start=$1 now=$2 idx i found=0
+  idx=$start
+  for i in $(seq 0 $(( N - 2 ))); do
+    if key_available "$idx" "$now"; then
+      found=1
+      break
+    fi
+    idx=$(( (idx + 1) % N ))
+    [ "$idx" -eq "$PRIMARY_IDX" ] && idx=$(( (PRIMARY_IDX + 1) % N ))
+    [ "$idx" -eq "$PRIMARY_IDX" ] && idx=1
+  done
+  if [ "$found" -eq 0 ]; then
+    echo "-1"
+    return 0
+  fi
+  echo "$idx"
+}
+
+do_acquire_session() {
+  local sid=$1 pid=${2:-$$}
+  [ -z "$sid" ] && { echo "usage: xot-rotate acquire <session_id> [pid]" >&2; exit 1; }
+  [ ! -r "$KEY_FILE" ] && { echo "xot-rotate: no keys file" >&2; exit 1; }
+  load_keys
+  [ "$N" -eq 0 ] && { echo "xot-rotate: no keys" >&2; exit 1; }
+
+  local idx
+  idx=$(with_flock python3 "$XOT_LOCK_PY" acquire "$sid" "$pid") || idx=-1
+  if [ "$idx" -lt 0 ] 2>/dev/null; then
+    echo "xot-rotate: no free key for session ${sid:0:12}… (all locked or cooling)" >&2
+    exit 1
+  fi
+
+  local key="${KEYS[$idx]}"
+  echo "export OPENROUTER_API_KEY='${key}'"
+  echo "export XOT_KEY_IDX='${idx}'"
+  echo "export XOT_SESSION_ID='${sid}'"
+  if [ "$idx" -eq "$PRIMARY_IDX" ]; then
+    echo "xot-rotate: session ${sid:0:12}… locked primary $(key_label $idx) $(key_suffix "$key")" >&2
+  else
+    echo "xot-rotate: session ${sid:0:12}… locked $(key_label $idx) $(key_suffix "$key") ($(tier_label $idx))" >&2
+  fi
+}
+
+do_release_session() {
+  local sid=$1
+  [ -z "$sid" ] && { echo "usage: xot-rotate release <session_id>" >&2; exit 1; }
+  lock_init || exit 1
+  with_flock python3 "$XOT_LOCK_PY" release "$sid" >/dev/null
+  echo "xot-rotate: released session ${sid:0:12}…" >&2
+}
+
+do_locks() {
+  lock_init || exit 1
+  python3 "$XOT_LOCK_PY" status
+}
+
+do_heartbeat_session() {
+  local sid=$1 pid=${2:-$$}
+  [ -z "$sid" ] && return 0
+  lock_init || return 0
+  with_flock python3 "$XOT_LOCK_PY" heartbeat "$sid" "$pid" >/dev/null 2>&1 || true
+}
+
+do_bump_session() {
+  local sid=$1 pid=${2:-$$}
+  [ -z "$sid" ] && { echo "usage: xot-rotate bump <session_id> [pid]" >&2; exit 1; }
+  [ ! -r "$KEY_FILE" ] && { echo "xot-rotate: no keys file" >&2; exit 1; }
+  load_keys
+  local idx
+  idx=$(with_flock python3 "$XOT_LOCK_PY" bump "$sid" "$pid") || idx=-1
+  if [ "$idx" -lt 0 ] 2>/dev/null; then
+    echo "xot-rotate: no free key to bump session ${sid:0:12}…" >&2
+    exit 1
+  fi
+  local key="${KEYS[$idx]}"
+  echo "export OPENROUTER_API_KEY='${key}'"
+  echo "export XOT_KEY_IDX='${idx}'"
+  echo "export XOT_SESSION_ID='${sid}'"
+  echo "xot-rotate: session ${sid:0:12}… bumped to $(key_label $idx) $(key_suffix "$key")" >&2
+}
+do_pick() {
+  [ ! -r "$KEY_FILE" ] && { echo "xot-rotate: no keys file: $KEY_FILE" >&2; exit 1; }
+  load_keys
+  [ "$N" -eq 0 ] && { echo "xot-rotate: no keys" >&2; exit 1; }
+
+  state_load
+  local now idx last_idx
+  now=$(date +%s)
+  last_idx=$ACTIVE_IDX
+
+  if key_available "$PRIMARY_IDX" "$now"; then
+    idx=$PRIMARY_IDX
+  elif key_available "$ACTIVE_IDX" "$now"; then
+    idx=$ACTIVE_IDX
+  else
+    local start
+    if [ "$ACTIVE_IDX" -eq "$PRIMARY_IDX" ] || [ "$ACTIVE_IDX" -lt 1 ]; then
+      start=1
+    else
+      start=$(( (ACTIVE_IDX + 1) % N ))
+      [ "$start" -eq "$PRIMARY_IDX" ] && start=1
+    fi
+    idx=$(find_next_backup "$start" "$now")
+  fi
+
+  if [ -z "$idx" ] || [ "$idx" -lt 0 ] 2>/dev/null; then
+    echo "xot-rotate: no free key (all locked or cooling)" >&2
+    exit 1
+  fi
+
+  local key="${KEYS[$idx]}"
+  with_flock state_save "$idx"
+
+  echo "export OPENROUTER_API_KEY='${key}'"
+  if [ "$idx" -eq "$PRIMARY_IDX" ]; then
+    echo "xot-rotate: primary $(key_label $idx) $(key_suffix "$key") (1000/day)" >&2
+  elif [ "$idx" != "$last_idx" ]; then
+    echo "xot-rotate: backup $(key_label $idx) $(key_suffix "$key") (was $(key_label $last_idx))" >&2
+  else
+    echo "xot-rotate: active $(key_label $idx) $(key_suffix "$key") ($(tier_label $idx))" >&2
+  fi
+}
+
+do_rotate() {
+  [ ! -r "$KEY_FILE" ] && { echo "xot-rotate: no keys file" >&2; exit 1; }
+  load_keys
+  state_load
+  local now start idx last_idx
+  now=$(date +%s)
+  last_idx=$ACTIVE_IDX
+
+  start=$(( (ACTIVE_IDX + 1) % N ))
+  [ "$start" -eq "$PRIMARY_IDX" ] && start=1
+  idx=$(find_next_backup "$start" "$now")
+  if [ -z "$idx" ] || [ "$idx" -lt 0 ] 2>/dev/null; then
+    echo "xot-rotate: no free key to rotate to (all locked or cooling)" >&2
+    exit 1
+  fi
+
+  local key="${KEYS[$idx]}"
+  with_flock state_save "$idx"
+  echo "export OPENROUTER_API_KEY='${key}'"
+  echo "xot-rotate: manual rotate -> $(key_label $idx) $(key_suffix "$key")" >&2
+}
+
+# Force KEY_N for a session. Refuses if another live session holds it.
+# --steal (first arg or after N) evicts the other session's lock.
+do_set_key() {
+  local steal=0 args=() a
+  for a in "$@"; do
+    if [ "$a" = "--steal" ] || [ "$a" = "steal" ]; then
+      steal=1
+    else
+      args+=("$a")
+    fi
+  done
+  local n=${args[0]:-} sid=${args[1]:-} pid=${args[2]:-$$}
+  [ -z "$n" ] && { echo "usage: xot-rotate set <N> [session_id] [pid] [--steal]  (1=KEY_01)" >&2; exit 1; }
+  [[ "$n" =~ ^[0-9]+$ ]] || { echo "xot-rotate: set expects integer 1..N" >&2; exit 1; }
+  [ ! -r "$KEY_FILE" ] && { echo "xot-rotate: no keys file" >&2; exit 1; }
+  load_keys
+  local idx=$(( n - 1 ))
+  if [ "$idx" -lt 0 ] || [ "$idx" -ge "$N" ]; then
+    echo "xot-rotate: key $n out of range (1..$N)" >&2
+    exit 1
+  fi
+  if [ -n "$sid" ]; then
+    lock_init || exit 1
+    local force_args=("$sid" "$idx" "$pid")
+    [ "$steal" -eq 1 ] && force_args+=(--steal)
+    local errf rc=0 out
+    errf="${STATE_FILE}.seterr.$$"
+    set +e
+    out=$(with_flock python3 "$XOT_LOCK_PY" force "${force_args[@]}" 2>"$errf")
+    rc=$?
+    set -e
+    local err=""
+    [ -f "$errf" ] && err=$(cat "$errf") && rm -f "$errf"
+    if [ "$rc" -ne 0 ]; then
+      local owner
+      owner=$(echo "$err" | awk '/LOCKED_BY/{print $2; exit}')
+      if [ -n "$owner" ]; then
+        echo "xot-rotate: $(key_label $idx) is locked by session ${owner:0:12}… — not stolen. Use a free key, or: xot-rotate set $n $sid $pid --steal" >&2
+      else
+        echo "xot-rotate: cannot force $(key_label $idx) (rc=$rc) ${err}" >&2
+      fi
+      exit 3
+    fi
+  else
+    state_load
+    with_flock state_save "$idx"
+  fi
+  local key="${KEYS[$idx]}"
+  echo "export OPENROUTER_API_KEY='${key}'"
+  echo "export XOT_KEY_IDX='${idx}'"
+  [ -n "$sid" ] && echo "export XOT_SESSION_ID='${sid}'"
+  if [ "$steal" -eq 1 ]; then
+    echo "xot-rotate: stole $(key_label $idx) $(key_suffix "$key") ($(tier_label $idx))${sid:+ for session ${sid:0:12}…}" >&2
+  else
+    echo "xot-rotate: forced $(key_label $idx) $(key_suffix "$key") ($(tier_label $idx))${sid:+ for session ${sid:0:12}…}" >&2
+  fi
+}
+
+do_cool() {
+  local arg=$1 until=${2:-0}
+  [ -z "$arg" ] && { echo "usage: xot-rotate cool <index|fingerprint> [until_epoch]" >&2; exit 1; }
+  load_keys
+  state_load
+  state_cool "$(resolve_fp "$arg")" "$until"
+}
+
+do_uncool() {
+  local arg=$1
+  [ -z "$arg" ] && { echo "usage: xot-rotate uncool <index|fingerprint>" >&2; exit 1; }
+  load_keys
+  state_uncool "$(resolve_fp "$arg")"
+  echo "xot-rotate: uncooled $arg" >&2
+}
+
+do_uncool_all() {
+  state_load
+  if [ -f "$STATE_FILE" ]; then
+    tmp=$(state_tmp)
+    grep -v '^COOL_' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  fi
+  with_flock state_save "$PRIMARY_IDX"
+  echo "xot-rotate: uncooled all keys; active=$(key_label $PRIMARY_IDX)" >&2
+}
+
+do_status() {
+  load_keys
+  state_load
+  local now
+  now=$(date +%s)
+
+  echo "POLICY=primary-first sticky-backup reset-based-cool"
+  echo "PRIMARY=$(key_label $PRIMARY_IDX) (index $PRIMARY_IDX, $(tier_label $PRIMARY_IDX))"
+  echo "ACTIVE=$(key_label $ACTIVE_IDX) (index $ACTIVE_IDX) suffix=$(key_suffix "${KEYS[$ACTIVE_IDX]}")"
+  echo "ROTATED_AT=${ROTATED_AT:-?}"
+  echo "NEXT_RESET_UTC=$(date -u -d "@$(midnight_utc_epoch)" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || midnight_utc_epoch)"
+  echo "--- all keys ---"
+  local i
+  for i in $(seq 0 $(( N - 1 ))); do
+    local fp status suffix tag=""
+    fp=$(key_fp "${KEYS[$i]}")
+    suffix=$(key_suffix "${KEYS[$i]}")
+    if is_cooling_idx "$i" "$now"; then
+      local cool_ts remain
+      cool_ts=$(grep "^COOL_${fp}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2)
+      remain=$(( cool_ts - now ))
+      status="COOLING ${remain}s (~$(date -u -d "@$cool_ts" '+%H:%M UTC' 2>/dev/null || echo ?))"
+    else
+      status="OK"
+    fi
+    [ "$i" -eq "$PRIMARY_IDX" ] && tag=" [PRIMARY $(tier_label $i)]"
+    [ "$i" -eq "$ACTIVE_IDX" ] && tag="${tag} [ACTIVE]"
+    echo "  $(key_label $i) idx=$i $suffix fp=$fp $status$tag"
+  done
+  echo "--- session locks ---"
+  if [ -f "$XOT_LOCK_PY" ]; then
+    python3 "$XOT_LOCK_PY" status 2>/dev/null | tail -n +2 || echo "  (unavailable)"
+  else
+    echo "  (xot-lock.py missing)"
+  fi
+}
+
+probe_one() {
+  local idx=$1 key suffix code remain limit err
+  key="${KEYS[$idx]}"
+  suffix=$(key_suffix "$key")
+  code=$(curl -s -D ${XOT_HOME}/probe.hdr.$$ -o ${XOT_HOME}/probe.json.$$ \
+    -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+    -d "{\"model\":\"$PROBE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":2}" \
+    "https://openrouter.ai/api/v1/chat/completions" -w "%{http_code}")
+  remain=$(grep -i '^x-ratelimit-remaining:' ${XOT_HOME}/probe.hdr.$$ 2>/dev/null | awk '{print $2}' | tr -d '\r' || true)
+  limit=$(grep -i '^x-ratelimit-limit:' ${XOT_HOME}/probe.hdr.$$ 2>/dev/null | awk '{print $2}' | tr -d '\r' || true)
+  err=$(python3 -c "import json; d=json.load(open('${XOT_HOME}/probe.json.$$')); print((d.get('error') or {}).get('message','OK')[:50])" 2>/dev/null || echo "?")
+  echo "  $(key_label $idx) $suffix HTTP=$code remain=${remain:-?}/${limit:-?} $err"
+}
+
+# Returns: OK | DAILY | OTHER (stdout only; details on stderr)
+probe_status() {
+  local idx=$1 key code body
+  key="${KEYS[$idx]}"
+  code=$(curl -s -D ${XOT_HOME}/probe.hdr.$$ -o ${XOT_HOME}/probe.json.$$ \
+    -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+    -d "{\"model\":\"$PROBE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":2}" \
+    "https://openrouter.ai/api/v1/chat/completions" -w "%{http_code}")
+  if [ "$code" = "200" ]; then
+    echo "OK"
+    return 0
+  fi
+  body=$(python3 -c "import json; d=json.load(open('${XOT_HOME}/probe.json.$$')); print((d.get('error') or {}).get('message',''))" 2>/dev/null || echo "")
+  if do_classify "$body" | grep -q '^daily$'; then
+    echo "DAILY"
+    return 0
+  fi
+  echo "OTHER"
+}
+probe_reset_epoch() {
+  local reset_hdr
+  reset_hdr=$(grep -i '^x-ratelimit-reset:' ${XOT_HOME}/probe.hdr.$$ 2>/dev/null | awk '{print $2}' | tr -d '\r' || true)
+  if [ -n "$reset_hdr" ] && [ "$reset_hdr" -gt 0 ] 2>/dev/null; then
+    normalize_until "$reset_hdr" 2>/dev/null || midnight_utc_epoch
+  else
+    midnight_utc_epoch
+  fi
+}
+
+do_sync_quota() {
+  local sid=${1:-} pid=${2:-$$}
+  [ ! -r "$KEY_FILE" ] && { echo "xot-rotate: no keys file: $KEY_FILE" >&2; exit 1; }
+  load_keys
+  state_load
+  local now i status until key idx=-1 owner locked
+  now=$(date +%s)
+
+  if [ -f "$STATE_FILE" ]; then
+    tmp=$(state_tmp)
+    grep -v '^COOL_' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  fi
+
+  locked=""
+  [ -f "$XOT_LOCK_PY" ] && locked=$(python3 "$XOT_LOCK_PY" locked 2>/dev/null || true)
+
+  for i in $(seq 0 $(( N - 1 ))); do
+    owner=""
+    if [ -f "$XOT_LOCK_PY" ]; then
+      owner=$(python3 "$XOT_LOCK_PY" owner "$i" 2>/dev/null || true)
+    fi
+    # Never probe a key locked by a *different* live session (would burn their quota).
+    if [ -n "$owner" ] && [ "$owner" != "$sid" ]; then
+      echo "xot-rotate: sync skip $(key_label $i) (locked by ${owner:0:12}…)" >&2
+      continue
+    fi
+    status=$(probe_status "$i")
+    if [ "$status" = "OK" ]; then
+      idx=$i
+      break
+    fi
+    if [ "$status" = "DAILY" ]; then
+      until=$(probe_reset_epoch)
+      state_cool "$(key_fp "${KEYS[$i]}")" "$until"
+      echo "xot-rotate: sync $(key_label $i) daily-capped remotely → cooled until $(date -u -d "@$until" '+%H:%M UTC' 2>/dev/null || echo ?)" >&2
+    fi
+  done
+
+  if [ -n "$sid" ]; then
+    # Re-acquire for this session only — do not clobber other session locks or ACTIVE_IDX.
+    local acquired
+    acquired=$(with_flock python3 "$XOT_LOCK_PY" acquire "$sid" "$pid") || acquired=-1
+    if [ "$acquired" -ge 0 ] 2>/dev/null; then
+      key="${KEYS[$acquired]}"
+      echo "export OPENROUTER_API_KEY='${key}'"
+      echo "export XOT_KEY_IDX='${acquired}'"
+      echo "export XOT_SESSION_ID='${sid}'"
+      echo "xot-rotate: sync re-acquired $(key_label $acquired) $(key_suffix "$key") for session ${sid:0:12}…" >&2
+      return 0
+    fi
+    echo "xot-rotate: sync found no working keys for session ${sid:0:12}…" >&2
+    exit 1
+  fi
+
+  if [ "$idx" -ge 0 ]; then
+    key="${KEYS[$idx]}"
+    state_save "$idx"
+    echo "export OPENROUTER_API_KEY='${key}'"
+    if [ "$idx" -eq "$PRIMARY_IDX" ]; then
+      echo "xot-rotate: sync picked primary $(key_label $idx) $(key_suffix "$key")" >&2
+    else
+      echo "xot-rotate: sync picked backup $(key_label $idx) $(key_suffix "$key") (primary exhausted on OpenRouter)" >&2
+    fi
+  else
+    echo "xot-rotate: sync found no working keys — all daily-capped or locked" >&2
+    do_pick
+  fi
+}
+
+do_probe() {
+  load_keys
+  local arg=${1:-active}
+  state_load
+  echo "PROBE_MODEL=$PROBE_MODEL"
+  if [ "$arg" = "all" ]; then
+    local i
+    for i in $(seq 0 $(( N - 1 ))); do
+      probe_one "$i"
+    done
+  elif [[ "$arg" =~ ^[0-9]+$ ]]; then
+    probe_one "$arg"
+  else
+    probe_one "$ACTIVE_IDX"
+  fi
+}
+
+do_classify() {
+  local text="${*:-}"
+  text=$(echo "$text" | tr '[:upper:]' '[:lower:]')
+  if echo "$text" | grep -qE 'shared[ _-]?pool|provider[ _-]?exhausted|upstream[ _-]?provider[ _-]?shared'; then
+    echo "shared"
+  elif echo "$text" | grep -qE 'unauthorized|invalid api|authentication required|\bhttp 401\b|\bhttp 403\b'; then
+    echo "auth"
+  elif echo "$text" | grep -qE 'free-models-per-day|openrouter_free_tier_daily|limit_rpd|high-balance|add 10 credits'; then
+    echo "daily"
+  elif echo "$text" | grep -qE 'retry\.maxdelayms|exceeds retry\.maxdelay|provider requested [0-9]+ms wait'; then
+    echo "daily"
+  elif echo "$text" | grep -qE '429|rate limit'; then
+    # :free default — empty-body / header-only 429 is a per-key daily cap.
+    echo "daily"
+  else
+    echo "other"
+  fi
+}
+
+CMD="${1:-pick}"
+case "$CMD" in
+  acquire)    shift; do_acquire_session "$@" ;;
+  release)    shift; do_release_session "$@" ;;
+  heartbeat)  shift; do_heartbeat_session "$@" ;;
+  bump)       shift; do_bump_session "$@" ;;
+  locks)      do_locks ;;
+  cool)       shift; do_cool "$@" ;;
+  uncool)     shift; do_uncool "$@" ;;
+  uncool_all) do_uncool_all ;;
+  sync_quota) shift; do_sync_quota "$@" ;;
+  status)     do_status ;;
+  pick)       do_pick ;;
+  set|key)    shift; do_set_key "$@" ;;
+  rotate)     do_rotate ;;
+  probe)      shift; do_probe "${1:-active}" ;;
+  classify)   shift; do_classify "$@" ;;
+  *)
+    echo "usage: xot-rotate {acquire|release|bump|locks|pick|set <N> [sid]|rotate|sync_quota|cool|uncool|uncool_all|status|probe|classify}" >&2
+    exit 1
+    ;;
+esac
